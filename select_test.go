@@ -28,16 +28,22 @@ func Benchmark_Genome_Cool_Select_Chan_NotCached(b *testing.B) {
 		AssemblyVersion sql.NullInt32   `mysql:"assembly_version"`
 		TotalLength     decimal.Decimal `mysql:"total_length"`
 		Created         time.Time       `mysql:"created"`
+		One             int             `mysql:"1"`
 	}
 
 	var genomeCh chan genomeRow
 	for n := 0; n < b.N; n++ {
+		var i int
 		genomeCh = make(chan genomeRow)
-		err := db.Select(genomeCh, "select`upid`,`assembly_acc`,`assembly_version`,`total_length`,`created`from`genome`where`total_length`>@@TotalLength limit 1000", 0, Params{
-			"TotalLength": 28111,
-		})
+		err := db.Select(genomeCh, "select`upid`,`assembly_acc`,`assembly_version`,`total_length`,`created`,1 from`genome`limit 1000", 0)
 		if err != nil {
 			panic(err)
+		}
+		for r := range genomeCh {
+			i += r.One
+		}
+		if i != 1000 {
+			// b.Fatal("didn't get 1k rows!")
 		}
 	}
 }
@@ -60,6 +66,7 @@ func Benchmark_Genome_Cool_Select_Slice_NotCached(b *testing.B) {
 
 	var genomes []genomeRow
 	for n := 0; n < b.N; n++ {
+		var i int
 		genomes = genomes[:0]
 		err := db.Select(&genomes, "select`upid`,`assembly_acc`,`assembly_version`,`total_length`,`created`from`genome`where`total_length`>@@TotalLength limit 1000", 0, Params{
 			"TotalLength": 28111,
@@ -67,10 +74,15 @@ func Benchmark_Genome_Cool_Select_Slice_NotCached(b *testing.B) {
 		if err != nil {
 			panic(err)
 		}
+		for _, r := range genomes {
+			if r.AssemblyAcc.Valid || r.AssemblyAcc.String == "" {
+				i++
+			}
+		}
+		if i != 1000 {
+			b.Fatal("didn't get 1k rows!")
+		}
 	}
-
-	// d, _ := json.Marshal(genomes)
-	// fmt.Println("Benchmark_Genome_Cool_Select_Slice_NotCached", sha3.Sum224(d))
 }
 
 func Benchmark_Genome_Cool_Select_Struct_NotCached(b *testing.B) {
@@ -133,6 +145,7 @@ func Benchmark_Genome_MySQL_Select_NotCached(b *testing.B) {
 	}
 
 	for n := 0; n < b.N; n++ {
+		var i int
 		rows, err := db.Query("select`upid`,`assembly_acc`,`assembly_version`,`total_length`,`created`from`genome`where`total_length`>? limit 1000", 28111)
 		if err != nil {
 			panic(err)
@@ -148,21 +161,25 @@ func Benchmark_Genome_MySQL_Select_NotCached(b *testing.B) {
 				&genome.TotalLength,
 				&genome.Created,
 			)
+			if genome.AssemblyAcc.Valid || genome.AssemblyAcc.String == "" {
+				i++
+			}
+		}
+		if i != 1000 {
+			b.Fatal("didn't get 1k rows!")
 		}
 	}
 }
 
+var sqlxDB, _ = sqlx.Connect("mysql", fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=utf8mb4&collation=utf8mb4_unicode_ci&parseTime=true",
+	user,
+	pass,
+	host,
+	port,
+	schema,
+))
+
 func Benchmark_Genome_SQLx_Select_Slice_NotCached(b *testing.B) {
-	db, err := sqlx.Connect("mysql", fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=utf8mb4&collation=utf8mb4_unicode_ci&parseTime=true",
-		user,
-		pass,
-		host,
-		port,
-		schema,
-	))
-	if err != nil {
-		panic(err)
-	}
 
 	type genomeRow struct {
 		UpID            string          `db:"upid"`
@@ -170,17 +187,22 @@ func Benchmark_Genome_SQLx_Select_Slice_NotCached(b *testing.B) {
 		AssemblyVersion sql.NullInt32   `db:"assembly_version"`
 		TotalLength     decimal.Decimal `db:"total_length"`
 		Created         time.Time       `db:"created"`
+		One             int             `db:"1"`
 	}
 
 	var genomes []genomeRow
 	for n := 0; n < b.N; n++ {
+		var i int
 		genomes = genomes[:0]
-		err := db.Select(&genomes, "select`upid`,`assembly_acc`,`assembly_version`,`total_length`,`created`from`genome`where`total_length`>? limit 1000", 28111)
+		err := sqlxDB.Select(&genomes, "select`upid`,`assembly_acc`,`assembly_version`,`total_length`,`created`,1,sleep(1) from`genome` limit 1000")
 		if err != nil {
 			panic(err)
 		}
+		for _, r := range genomes {
+			i += r.One
+		}
+		if i != 1000 {
+			b.Fatal("didn't get 1k rows!")
+		}
 	}
-
-	// d, _ := json.Marshal(genomes)
-	// fmt.Println("Benchmark_Genome_SQLx_Select_Slice_NotCached", sha3.Sum224(d))
 }

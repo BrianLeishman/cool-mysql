@@ -1,23 +1,19 @@
 package mysql
 
 import (
-	"bytes"
 	"context"
 	"crypto/md5"
 	"database/sql"
 	"encoding/base64"
 	"encoding/gob"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"reflect"
-	"sync"
 	"time"
 
 	"github.com/go-redis/redis/v8"
 	"github.com/pkg/errors"
-	"github.com/tinylib/msgp/msgp"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -74,14 +70,12 @@ var rCtx = context.Background()
 
 var selectSinglelight = new(singleflight.Group)
 
-var bufPool = sync.Pool{
-	New: func() interface{} {
-		return new(bytes.Buffer)
-	},
+type FastDest interface {
+	CoolMySQLRowSerialize(buff *[]byte, cols []*sql.ColumnType, ptrs []interface{})
+	CoolMySQLRowDeserialize(buf *[]byte) (ptrs []interface{}, err error)
+	CoolMySQLRowScan(ptrs []interface{}) error
 }
 
-// Select selects one or more rows into the
-// chan of structs in the destination
 func (db *Database) Select(dest interface{}, query string, cache time.Duration, params ...Params) error {
 	replacedQuery, mergedParams := ReplaceParams(query, params...)
 	if db.die {
@@ -89,366 +83,586 @@ func (db *Database) Select(dest interface{}, query string, cache time.Duration, 
 		os.Exit(0)
 	}
 
-	refDest, kind, strct, err := checkDest(dest)
-	if err != nil {
-		return err
+	rd := reflect.ValueOf(dest)
+	switch rd.Kind() {
+	case reflect.Chan:
+		go func() {
+			err := _select(db, rd, replacedQuery, cache, mergedParams)
+			if err != nil {
+				panic(err)
+			}
+			rd.Close()
+		}()
+		return nil
+	case reflect.Ptr:
+		return _select(db, rd, replacedQuery, cache, mergedParams)
+	default:
+		return errors.New("cool-mysql: select destination must be a channel or a pointer to something")
 	}
+}
 
-	var msgpWriter *msgp.Writer
-	var gobEncoder *gob.Encoder
-
-	var msgpEncodable bool
-	if cache != 0 {
-		_, msgpEncodable = reflect.New(strct).Interface().(msgp.Encodable)
+func getDestType(rd reflect.Value) reflect.Type {
+	switch rd.Kind() {
+	case reflect.Chan, reflect.Slice:
+		return rd.Type().Elem()
+	default:
+		return rd.Type()
 	}
+}
 
-	var start time.Time
+func _select(db *Database, rd reflect.Value, replacedQuery string, cache time.Duration, mergedParams Params) error {
+	rd = reflect.Indirect(rd)
+	rt := getDestType(rd)
+	rv := reflect.New(rt)
 
-	liveGet := func() error {
-		start = time.Now()
+	var cacheBuf []byte
+
+	cache = 10 * time.Second
+
+	single := rd.Kind() != reflect.Chan && rd.Kind() != reflect.Slice
+	rowsScanned := 0
+
+	readFromDB := func() error {
 		rows, err := db.Reads.Query(replacedQuery)
-		execDuration := time.Since(start)
-		start = time.Now()
-		db.callLog(replacedQuery, mergedParams, execDuration)
-
 		if err != nil {
-			if kind == reflect.Chan {
-				refDest.Close()
-			}
-			return Error{
-				Err:           err,
-				OriginalQuery: query,
-				ReplacedQuery: replacedQuery,
-				Params:        mergedParams,
-			}
+			return err
+		}
+		defer rows.Close()
+
+		cols, err := rows.ColumnTypes()
+		if err != nil {
+			return err
+		}
+		ptrs := make([]interface{}, len(cols))
+		for i := range ptrs {
+			ptrs[i] = new(sql.RawBytes)
 		}
 
-		main := func() error {
-			if db.Finished != nil {
-				defer func() { db.Finished(false, replacedQuery, mergedParams, execDuration, time.Since(start)) }()
+		for rows.Next() {
+			err := rows.Scan(ptrs...)
+			if err != nil {
+				return err
+			}
+			rowsScanned++
+
+			if cache != 0 {
+				rv.Interface().(FastDest).CoolMySQLRowSerialize(&cacheBuf, cols, ptrs)
 			}
 
-			if kind == reflect.Chan {
-				defer refDest.Close()
-			}
-			defer rows.Close()
-
-			cols, _ := rows.Columns()
-			pointers := make([]interface{}, len(cols))
-
-			columns := make([]*column, len(cols))
-
-			fieldsLen := strct.NumField()
-			fields := make([]*field, fieldsLen)
-
-			strctEx := reflect.New(strct).Elem()
-
-			var jsonablesCount uint16
-			for i, c := range cols {
-				for j := 0; j < fieldsLen; j++ {
-					if fields[j] == nil {
-						f := strct.Field(j)
-						name, ok := f.Tag.Lookup("mysql")
-						if !ok {
-							name = f.Name
-						}
-						kind := f.Type.Kind()
-
-						var jsonable bool
-
-						switch kind {
-						case reflect.Map, reflect.Struct:
-							jsonable = true
-						case reflect.Array, reflect.Slice:
-							// if it's a slice, but not a byte slice
-							if f.Type.Elem().Kind() != reflect.Uint8 {
-								jsonable = true
-							}
-						}
-
-						if jsonable {
-							prop := strctEx.Field(j)
-
-							// don't let things that already handle themselves get json unmarshalled
-							if _, ok := prop.Addr().Interface().(sql.Scanner); ok {
-								jsonable = false
-							}
-
-							// we also have to ignore times specifically, because sql scanning
-							// implements them literally, instead of the time.Time implementing sql.Scanner
-							if _, ok := prop.Interface().(time.Time); ok {
-								jsonable = false
-							}
-						}
-
-						fields[j] = &field{
-							name:     name,
-							jsonable: jsonable,
-						}
-					}
-					if fields[j].taken {
-						continue
-					}
-
-					if fields[j].name == c {
-						columns[i] = &column{
-							structIndex:   uint16(j),
-							jsonable:      fields[j].jsonable,
-							jsonableIndex: jsonablesCount,
-						}
-						fields[j].taken = true
-
-						if fields[j].jsonable {
-							jsonablesCount++
-						}
-					}
-				}
-			}
-
-			var x interface{}
-
-			ran := false
-
-			var jsonables [][]byte
-			if jsonablesCount > 0 {
-				jsonables = make([][]byte, jsonablesCount)
-			}
-		Rows:
-			for rows.Next() {
-				ran = true
-
-				s := reflect.New(strct).Elem()
-
-				for i, c := range columns {
-					if c != nil {
-						if !c.jsonable {
-							pointers[i] = s.Field(int(c.structIndex)).Addr().Interface()
-						} else {
-							pointers[i] = &jsonables[c.jsonableIndex]
-						}
-					} else {
-						pointers[i] = &x
-					}
-				}
-				err = rows.Scan(pointers...)
-				if err != nil {
-					return errors.Wrapf(err, "failed to scan rows")
-				}
-
-				if jsonablesCount > 0 {
-					for _, c := range columns {
-						if c == nil || !c.jsonable || jsonables[c.jsonableIndex] == nil {
-							continue
-						}
-
-						err := json.Unmarshal(jsonables[c.jsonableIndex], s.Field(int(c.structIndex)).Addr().Interface())
-						if err != nil {
-							return errors.Wrapf(err, "failed to unmarshal %q", jsonables[c.jsonableIndex])
-						}
-					}
-				}
-
-				if cache != 0 {
-					switch {
-					case msgpEncodable:
-						err := s.Addr().Interface().(msgp.Encodable).EncodeMsg(msgpWriter)
-						if err != nil {
-							return errors.Wrapf(err, "failed to write struct to cache with msgp")
-						}
-					default:
-						err := gobEncoder.EncodeValue(s)
-						if err != nil {
-							return errors.Wrapf(err, "failed to write struct to cache with gob")
-						}
-					}
-				}
-
-				switch kind {
-				case reflect.Chan:
-					refDest.Send(s)
-				case reflect.Slice:
-					refDest.Set(reflect.Append(refDest, s))
-				case reflect.Struct:
-					refDest.Set(s)
-					break Rows
-				}
-
-				x = nil
-			}
-
-			if !ran && kind == reflect.Struct {
-				return sql.ErrNoRows
-			}
-
-			return nil
-		}
-
-		switch kind {
-		case reflect.Chan:
-			if cache == 0 {
-				go func() {
-					if err := main(); err != nil {
-						panic(err)
-					}
-				}()
-			} else {
-				return main()
-			}
-		case reflect.Slice, reflect.Struct:
-			refDest = refDest.Elem()
-			return main()
-		}
-		return nil
-	}
-
-	cacheGet := func(b []byte) error {
-		execDuration := time.Since(start)
-		start = time.Now()
-		db.callLog("/* cached! */ "+replacedQuery, mergedParams, execDuration)
-
-		main := func() error {
-			if db.Finished != nil {
-				defer func() { db.Finished(true, replacedQuery, mergedParams, execDuration, time.Since(start)) }()
-			}
-
-			if kind == reflect.Chan {
-				defer refDest.Close()
-			}
-
-			var msgpReader *msgp.Reader
-			var gobDecoder *gob.Decoder
-
-			switch {
-			case msgpEncodable:
-				msgpReader = msgp.NewReader(bytes.NewReader(b))
-			default:
-				gobDecoder = gob.NewDecoder(bytes.NewReader(b))
-			}
-
-		Rows:
-			for {
-				var s reflect.Value
-
-				switch {
-				case msgpEncodable:
-					s = reflect.New(strct)
-					err := s.Interface().(msgp.Decodable).DecodeMsg(msgpReader)
-					if err != nil && err.Error() == "EOF" {
-						break Rows
-					} else if err != nil {
-						return errors.Wrapf(err, "failed to decode cached struct with msgp")
-					}
-					s = s.Elem()
-				default:
-					s = reflect.New(strct).Elem()
-					err := gobDecoder.DecodeValue(s)
-					if err == io.EOF {
-						break Rows
-					} else if err != nil {
-						return errors.Wrapf(err, "failed to decode cached struct with gob")
-					}
-				}
-
-				switch kind {
-				case reflect.Chan:
-					refDest.Send(s)
-				case reflect.Slice:
-					refDest.Set(reflect.Append(refDest, s))
-				case reflect.Struct:
-					refDest.Set(s)
-					break Rows
-				}
-			}
-
-			return nil
-		}
-
-		switch kind {
-		case reflect.Chan:
-			go func() {
-				if err := main(); err != nil {
-					panic(err)
-				}
-			}()
-		case reflect.Slice, reflect.Struct:
-			refDest = refDest.Elem()
-			return main()
-		}
-		return nil
-	}
-
-	if cache != 0 {
-		if db.redis == nil {
-			return errors.New("cool-mysql select: cache time given without redis connection for query")
-		}
-
-		main := func() error {
-			hasher := md5.New()
-			gob.NewEncoder(hasher).EncodeValue(reflect.New(strct))
-			hasher.Write([]byte(replacedQuery))
-			h := base64.RawStdEncoding.EncodeToString(hasher.Sum(nil))
-
-			destFilled := false
-			cache, err, _ := selectSinglelight.Do(h, func() (interface{}, error) {
-				start = time.Now()
-				b, err := db.redis.Get(rCtx, h).Bytes()
-				if err == redis.Nil {
-					var buf bytes.Buffer
-					switch {
-					case msgpEncodable:
-						msgpWriter = msgp.NewWriter(&buf)
-					default:
-						gobEncoder = gob.NewEncoder(&buf)
-					}
-
-					err = liveGet()
-					if err != nil {
-						return nil, err
-					}
-					destFilled = true
-
-					if msgpEncodable {
-						msgpWriter.Flush()
-					}
-
-					err = db.redis.Set(rCtx, h, buf.Bytes(), cache).Err()
-					if err != nil {
-						return nil, errors.Wrapf(err, "cool-mysql select: failed to set query cache to redis")
-					}
-
-					start = time.Now()
-
-					return buf.Bytes(), nil
-				}
-				if err != nil {
-					return nil, errors.Wrapf(err, "cool-mysql select: failed to get query cache from redis")
-				}
-
-				return b, nil
-			})
+			err = rv.Interface().(FastDest).CoolMySQLRowScan(ptrs)
 			if err != nil {
 				return err
 			}
 
-			if !destFilled {
-				return cacheGet(cache.([]byte))
+			switch rd.Kind() {
+			case reflect.Chan:
+				rd.Send(rv.Elem())
+			case reflect.Slice:
+				rd.Set(reflect.Append(rd, rv.Elem()))
+			default:
+				rd.Set(rv.Elem())
+				break
 			}
-
-			return nil
 		}
-
-		if kind == reflect.Chan {
-			go func() {
-				if err := main(); err != nil {
-					panic(err)
-				}
-			}()
-			return nil
-		}
-
-		return main()
+		return nil
 	}
 
-	// we got this far, so just fill the dest with a normal live get
-	return liveGet()
+	if cache == 0 {
+		err := readFromDB()
+		if err != nil {
+			return err
+		}
+	} else {
+		if db.redis == nil {
+			return errors.New("cache duration given without redis connection")
+		}
+
+		hasher := md5.New()
+		gob.NewEncoder(hasher).EncodeValue(rv)
+		hasher.Write([]byte(replacedQuery))
+		h := base64.RawStdEncoding.EncodeToString(hasher.Sum(nil))
+
+		scanned := false
+		cachedBytes, err, _ := selectSinglelight.Do(h, func() (interface{}, error) {
+			b, err := db.redis.Get(rCtx, h).Bytes()
+			if err == redis.Nil {
+				err := readFromDB()
+				if err != nil {
+					return nil, err
+				}
+				scanned = true
+
+				err = db.redis.Set(rCtx, h, cacheBuf, cache).Err()
+				if err != nil {
+					return nil, err
+				}
+
+				return cacheBuf, nil
+			} else if err != nil {
+				return nil, err
+			}
+
+			return b, nil
+		})
+		if err != nil {
+			return err
+		}
+
+		if !scanned {
+			b := cachedBytes.([]byte)
+			for {
+				ptrs, err := rv.Interface().(FastDest).CoolMySQLRowDeserialize(&b)
+				if err == io.EOF {
+					break
+				} else if err != nil {
+					return err
+				}
+
+				err = rv.Interface().(FastDest).CoolMySQLRowScan(ptrs)
+				if err != nil {
+					return err
+				}
+
+				switch rd.Kind() {
+				case reflect.Chan:
+					rd.Send(rv.Elem())
+				case reflect.Slice:
+					rd.Set(reflect.Append(rd, rv.Elem()))
+				default:
+					rd.Set(rv.Elem())
+					break
+				}
+			}
+		}
+	}
+
+	if single && rowsScanned == 0 {
+		return sql.ErrNoRows
+	}
+
+	return nil
 }
+
+// Select selects one or more rows into the
+// chan of structs in the destination
+// func (db *Database) _Select(dest interface{}, query string, cache time.Duration, params ...Params) error {
+// 	replacedQuery, mergedParams := ReplaceParams(query, params...)
+// 	if db.die {
+// 		fmt.Println(replacedQuery)
+// 		os.Exit(0)
+// 	}
+
+// 	refDest, kind, strct, err := checkDest(dest)
+// 	if err != nil {
+// 		return err
+// 	}
+
+// 	var msgpWriter *msgp.Writer
+// 	var gobEncoder *gob.Encoder
+// 	// var cacheBuffer *bytes.Buffer
+
+// 	newStrct := reflect.New(strct).Interface()
+
+// 	var msgpEncodable bool
+// 	if cache != 0 {
+// 		_, msgpEncodable = newStrct.(msgp.Encodable)
+// 	}
+
+// 	_, fastDest := newStrct.(FastDest)
+
+// 	var start time.Time
+
+// 	liveGet := func() error {
+// 		start = time.Now()
+// 		rows, err := db.Reads.Query(replacedQuery)
+// 		execDuration := time.Since(start)
+// 		start = time.Now()
+// 		db.callLog(replacedQuery, mergedParams, execDuration)
+
+// 		if err != nil {
+// 			if kind == reflect.Chan {
+// 				refDest.Close()
+// 			}
+// 			return Error{
+// 				Err:           err,
+// 				OriginalQuery: query,
+// 				ReplacedQuery: replacedQuery,
+// 				Params:        mergedParams,
+// 			}
+// 		}
+
+// 		main := func() error {
+// 			if db.Finished != nil {
+// 				defer func() { db.Finished(false, replacedQuery, mergedParams, execDuration, time.Since(start)) }()
+// 			}
+
+// 			if kind == reflect.Chan {
+// 				defer refDest.Close()
+// 			}
+// 			defer rows.Close()
+
+// 			cols, _ := rows.ColumnTypes()
+// 			ptrs := make([]interface{}, len(cols))
+// 			for i := range ptrs {
+// 				ptrs[i] = new(sql.RawBytes)
+// 			}
+
+// 			buf := new(bytes.Buffer)
+
+// 			if fastDest {
+// 			RowsLoop:
+// 				for rows.Next() {
+// 					v := reflect.New(strct)
+
+// 					rows.Scan(ptrs...)
+// 					// spew.Dump(ptrs)
+
+// 					buf.Reset()
+
+// 					v.Interface().(FastDest).CoolMySQLRowSerialize(buf, cols, ptrs)
+// 					// spew.Dump(buf.Bytes())
+// 					// os.Exit(0)
+
+// 					// if cache != 0 {
+// 					// 	cacheBuffer.Write(b)
+// 					// }
+
+// 					err := v.Interface().(FastDest).CoolMySQLRowScan(ptrs, cols)
+// 					if err != nil {
+// 						return err
+// 					}
+
+// 					v = v.Elem()
+
+// 					switch kind {
+// 					case reflect.Chan:
+// 						refDest.Send(v)
+// 					case reflect.Slice:
+// 						refDest.Set(reflect.Append(refDest, v))
+// 					default:
+// 						refDest.Set(v)
+// 						break RowsLoop
+// 					}
+// 				}
+
+// 				return nil
+// 			}
+
+// 			pointers := make([]interface{}, len(cols))
+
+// 			columns := make([]*column, len(cols))
+
+// 			fieldsLen := strct.NumField()
+// 			fields := make([]*field, fieldsLen)
+
+// 			strctEx := reflect.New(strct).Elem()
+
+// 			var jsonablesCount uint16
+// 			for i, c := range cols {
+// 				for j := 0; j < fieldsLen; j++ {
+// 					if fields[j] == nil {
+// 						f := strct.Field(j)
+// 						name, ok := f.Tag.Lookup("mysql")
+// 						if !ok {
+// 							name = f.Name
+// 						}
+// 						kind := f.Type.Kind()
+
+// 						var jsonable bool
+
+// 						switch kind {
+// 						case reflect.Map, reflect.Struct:
+// 							jsonable = true
+// 						case reflect.Array, reflect.Slice:
+// 							// if it's a slice, but not a byte slice
+// 							if f.Type.Elem().Kind() != reflect.Uint8 {
+// 								jsonable = true
+// 							}
+// 						}
+
+// 						if jsonable {
+// 							prop := strctEx.Field(j)
+
+// 							// don't let things that already handle themselves get json unmarshalled
+// 							if _, ok := prop.Addr().Interface().(sql.Scanner); ok {
+// 								jsonable = false
+// 							}
+
+// 							// we also have to ignore times specifically, because sql scanning
+// 							// implements them literally, instead of the time.Time implementing sql.Scanner
+// 							if _, ok := prop.Interface().(time.Time); ok {
+// 								jsonable = false
+// 							}
+// 						}
+
+// 						fields[j] = &field{
+// 							name:     name,
+// 							jsonable: jsonable,
+// 						}
+// 					}
+// 					if fields[j].taken {
+// 						continue
+// 					}
+
+// 					if fields[j].name == c.Name() {
+// 						columns[i] = &column{
+// 							structIndex:   uint16(j),
+// 							jsonable:      fields[j].jsonable,
+// 							jsonableIndex: jsonablesCount,
+// 						}
+// 						fields[j].taken = true
+
+// 						if fields[j].jsonable {
+// 							jsonablesCount++
+// 						}
+// 					}
+// 				}
+// 			}
+
+// 			var x interface{}
+
+// 			ran := false
+
+// 			var jsonables [][]byte
+// 			if jsonablesCount > 0 {
+// 				jsonables = make([][]byte, jsonablesCount)
+// 			}
+// 		Rows:
+// 			for rows.Next() {
+// 				ran = true
+
+// 				s := reflect.New(strct).Elem()
+
+// 				for i, c := range columns {
+// 					if c != nil {
+// 						if !c.jsonable {
+// 							pointers[i] = s.Field(int(c.structIndex)).Addr().Interface()
+// 						} else {
+// 							pointers[i] = &jsonables[c.jsonableIndex]
+// 						}
+// 					} else {
+// 						pointers[i] = &x
+// 					}
+// 				}
+// 				err = rows.Scan(pointers...)
+// 				if err != nil {
+// 					return errors.Wrapf(err, "failed to scan rows")
+// 				}
+
+// 				if jsonablesCount > 0 {
+// 					for _, c := range columns {
+// 						if c == nil || !c.jsonable || jsonables[c.jsonableIndex] == nil {
+// 							continue
+// 						}
+
+// 						err := json.Unmarshal(jsonables[c.jsonableIndex], s.Field(int(c.structIndex)).Addr().Interface())
+// 						if err != nil {
+// 							return errors.Wrapf(err, "failed to unmarshal %q", jsonables[c.jsonableIndex])
+// 						}
+// 					}
+// 				}
+
+// 				if cache != 0 {
+// 					switch {
+// 					case msgpEncodable:
+// 						err := s.Addr().Interface().(msgp.Encodable).EncodeMsg(msgpWriter)
+// 						if err != nil {
+// 							return errors.Wrapf(err, "failed to write struct to cache with msgp")
+// 						}
+// 					default:
+// 						err := gobEncoder.EncodeValue(s)
+// 						if err != nil {
+// 							return errors.Wrapf(err, "failed to write struct to cache with gob")
+// 						}
+// 					}
+// 				}
+
+// 				switch kind {
+// 				case reflect.Chan:
+// 					refDest.Send(s)
+// 				case reflect.Slice:
+// 					refDest.Set(reflect.Append(refDest, s))
+// 				case reflect.Struct:
+// 					refDest.Set(s)
+// 					break Rows
+// 				}
+
+// 				x = nil
+// 			}
+
+// 			if !ran && kind == reflect.Struct {
+// 				return sql.ErrNoRows
+// 			}
+
+// 			return nil
+// 		}
+
+// 		switch kind {
+// 		case reflect.Chan:
+// 			if cache == 0 {
+// 				go func() {
+// 					if err := main(); err != nil {
+// 						panic(err)
+// 					}
+// 				}()
+// 			} else {
+// 				return main()
+// 			}
+// 		case reflect.Slice, reflect.Struct:
+// 			refDest = refDest.Elem()
+// 			return main()
+// 		}
+// 		return nil
+// 	}
+
+// 	cacheGet := func(b []byte) error {
+// 		execDuration := time.Since(start)
+// 		start = time.Now()
+// 		db.callLog("/* cached! */ "+replacedQuery, mergedParams, execDuration)
+
+// 		main := func() error {
+// 			if db.Finished != nil {
+// 				defer func() { db.Finished(true, replacedQuery, mergedParams, execDuration, time.Since(start)) }()
+// 			}
+
+// 			if kind == reflect.Chan {
+// 				defer refDest.Close()
+// 			}
+
+// 			var msgpReader *msgp.Reader
+// 			var gobDecoder *gob.Decoder
+
+// 			switch {
+// 			case msgpEncodable:
+// 				msgpReader = msgp.NewReader(bytes.NewReader(b))
+// 			default:
+// 				gobDecoder = gob.NewDecoder(bytes.NewReader(b))
+// 			}
+
+// 		Rows:
+// 			for {
+// 				var s reflect.Value
+
+// 				switch {
+// 				case msgpEncodable:
+// 					s = reflect.New(strct)
+// 					err := s.Interface().(msgp.Decodable).DecodeMsg(msgpReader)
+// 					if err != nil && err.Error() == "EOF" {
+// 						break Rows
+// 					} else if err != nil {
+// 						return errors.Wrapf(err, "failed to decode cached struct with msgp")
+// 					}
+// 					s = s.Elem()
+// 				default:
+// 					s = reflect.New(strct).Elem()
+// 					err := gobDecoder.DecodeValue(s)
+// 					if err == io.EOF {
+// 						break Rows
+// 					} else if err != nil {
+// 						return errors.Wrapf(err, "failed to decode cached struct with gob")
+// 					}
+// 				}
+
+// 				switch kind {
+// 				case reflect.Chan:
+// 					refDest.Send(s)
+// 				case reflect.Slice:
+// 					refDest.Set(reflect.Append(refDest, s))
+// 				case reflect.Struct:
+// 					refDest.Set(s)
+// 					break Rows
+// 				}
+// 			}
+
+// 			return nil
+// 		}
+
+// 		switch kind {
+// 		case reflect.Chan:
+// 			go func() {
+// 				if err := main(); err != nil {
+// 					panic(err)
+// 				}
+// 			}()
+// 		case reflect.Slice, reflect.Struct:
+// 			refDest = refDest.Elem()
+// 			return main()
+// 		}
+// 		return nil
+// 	}
+
+// 	if cache != 0 {
+// 		if db.redis == nil {
+// 			return errors.New("cool-mysql select: cache time given without redis connection for query")
+// 		}
+
+// 		main := func() error {
+// 			hasher := md5.New()
+// 			gob.NewEncoder(hasher).EncodeValue(reflect.New(strct))
+// 			hasher.Write([]byte(replacedQuery))
+// 			h := base64.RawStdEncoding.EncodeToString(hasher.Sum(nil))
+
+// 			destFilled := false
+// 			cache, err, _ := selectSinglelight.Do(h, func() (interface{}, error) {
+// 				start = time.Now()
+// 				b, err := db.redis.Get(rCtx, h).Bytes()
+// 				if err == redis.Nil {
+// 					var buf bytes.Buffer
+// 					switch {
+// 					case msgpEncodable:
+// 						msgpWriter = msgp.NewWriter(&buf)
+// 					default:
+// 						gobEncoder = gob.NewEncoder(&buf)
+// 					}
+
+// 					err = liveGet()
+// 					if err != nil {
+// 						return nil, err
+// 					}
+// 					destFilled = true
+
+// 					if msgpEncodable {
+// 						msgpWriter.Flush()
+// 					}
+
+// 					err = db.redis.Set(rCtx, h, buf.Bytes(), cache).Err()
+// 					if err != nil {
+// 						return nil, errors.Wrapf(err, "cool-mysql select: failed to set query cache to redis")
+// 					}
+
+// 					start = time.Now()
+
+// 					return buf.Bytes(), nil
+// 				}
+// 				if err != nil {
+// 					return nil, errors.Wrapf(err, "cool-mysql select: failed to get query cache from redis")
+// 				}
+
+// 				return b, nil
+// 			})
+// 			if err != nil {
+// 				return err
+// 			}
+
+// 			if !destFilled {
+// 				return cacheGet(cache.([]byte))
+// 			}
+
+// 			return nil
+// 		}
+
+// 		if kind == reflect.Chan {
+// 			go func() {
+// 				if err := main(); err != nil {
+// 					panic(err)
+// 				}
+// 			}()
+// 			return nil
+// 		}
+
+// 		return main()
+// 	}
+
+// 	// we got this far, so just fill the dest with a normal live get
+// 	return liveGet()
+// }
