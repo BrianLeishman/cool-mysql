@@ -70,10 +70,17 @@ var rCtx = context.Background()
 
 var selectSinglelight = new(singleflight.Group)
 
+// FastDest is a type that implements all the helper funcs
+// to tell us exactly how to store raw mysql data into it
+// ideally, these funcs will be generated with `go generate`
 type FastDest interface {
-	CoolMySQLRowSerialize(buff *[]byte, cols []*sql.ColumnType, ptrs []interface{})
+	CoolMySQLExportedColCount() int
+	CoolMySQLGetColumns(colTypes []*sql.ColumnType) (cols []Column)
+	CoolMySQLColumnsSerialize(buf *[]byte, cols []Column)
+	CoolMySQLRowSerialize(buf *[]byte, cols []Column, ptrs []interface{})
+	CoolMySQLColumnsDeserialize(buf *[]byte) (cols []Column, err error)
 	CoolMySQLRowDeserialize(buf *[]byte) (ptrs []interface{}, err error)
-	CoolMySQLRowScan(ptrs []interface{}) error
+	CoolMySQLRowScan(cols []Column, ptrs []interface{}) error
 }
 
 func (db *Database) Select(dest interface{}, query string, cache time.Duration, params ...Params) error {
@@ -110,14 +117,23 @@ func getDestType(rd reflect.Value) reflect.Type {
 	}
 }
 
+// Column is the name and scan type of a query column
+// used in (de)serialization
+type Column struct {
+	Name     string
+	ScanType uint8
+}
+
 func _select(db *Database, rd reflect.Value, replacedQuery string, cache time.Duration, mergedParams Params) error {
 	rd = reflect.Indirect(rd)
 	rt := getDestType(rd)
 	rv := reflect.New(rt)
 
+	fd := rv.Interface().(FastDest)
+
 	var cacheBuf []byte
 
-	cache = 10 * time.Second
+	// cache = 10 * time.Second
 
 	single := rd.Kind() != reflect.Chan && rd.Kind() != reflect.Slice
 	rowsScanned := 0
@@ -129,14 +145,17 @@ func _select(db *Database, rd reflect.Value, replacedQuery string, cache time.Du
 		}
 		defer rows.Close()
 
-		cols, err := rows.ColumnTypes()
+		colTypes, err := rows.ColumnTypes()
 		if err != nil {
 			return err
 		}
-		ptrs := make([]interface{}, len(cols))
-		for i := range ptrs {
+
+		ptrs := make([]interface{}, len(colTypes))
+		for i := 0; i < len(colTypes); i++ {
 			ptrs[i] = new(sql.RawBytes)
 		}
+
+		var cols []Column
 
 		for rows.Next() {
 			err := rows.Scan(ptrs...)
@@ -145,11 +164,18 @@ func _select(db *Database, rd reflect.Value, replacedQuery string, cache time.Du
 			}
 			rowsScanned++
 
-			if cache != 0 {
-				rv.Interface().(FastDest).CoolMySQLRowSerialize(&cacheBuf, cols, ptrs)
+			if cols == nil {
+				cols = fd.CoolMySQLGetColumns(colTypes)
+				if cache != 0 {
+					fd.CoolMySQLColumnsSerialize(&cacheBuf, cols)
+				}
 			}
 
-			err = rv.Interface().(FastDest).CoolMySQLRowScan(ptrs)
+			if cache != 0 {
+				fd.CoolMySQLRowSerialize(&cacheBuf, cols, ptrs)
+			}
+
+			err = fd.CoolMySQLRowScan(cols, ptrs)
 			if err != nil {
 				return err
 			}
@@ -208,17 +234,20 @@ func _select(db *Database, rd reflect.Value, replacedQuery string, cache time.Du
 			return err
 		}
 
-		if !scanned {
-			b := cachedBytes.([]byte)
+		if b := cachedBytes.([]byte); len(b) != 0 && !scanned {
+			cols, err := fd.CoolMySQLColumnsDeserialize(&b)
+			if err != nil {
+				return err
+			}
 			for {
-				ptrs, err := rv.Interface().(FastDest).CoolMySQLRowDeserialize(&b)
+				ptrs, err := fd.CoolMySQLRowDeserialize(&b)
 				if err == io.EOF {
 					break
 				} else if err != nil {
 					return err
 				}
 
-				err = rv.Interface().(FastDest).CoolMySQLRowScan(ptrs)
+				err = fd.CoolMySQLRowScan(cols, ptrs)
 				if err != nil {
 					return err
 				}

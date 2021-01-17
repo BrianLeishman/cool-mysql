@@ -21,57 +21,130 @@ type GenomeRow struct {
 	One             int             `mysql:"1"`
 }
 
-func (z *GenomeRow) CoolMySQLRowSerialize(b *[]byte, cols []*sql.ColumnType, ptrs []interface{}) {
-	totalLen := 0
-	for i, c := range cols {
-		switch c.Name() {
+func (z *GenomeRow) CoolMySQLExportedColCount() int {
+	return 6
+}
+
+func (z *GenomeRow) CoolMySQLGetColumns(colTypes []*sql.ColumnType) (cols []Column) {
+	cols = make([]Column, 0, z.CoolMySQLExportedColCount())
+	for _, ct := range colTypes {
+		switch n := ct.Name(); n {
 		case "upid", "assembly_acc", "assembly_version", "total_length", "created", "1":
-			rb := ptrs[i].(*sql.RawBytes)
-			if *rb == nil {
-				totalLen++
-			} else {
-				totalLen += 1 + 8 + len(*rb)
-			}
+			cols = append(cols, Column{
+				Name:     n,
+				ScanType: ScanType(ct),
+			})
 		}
 	}
 
-	if cap(*b)-len(*b) < totalLen {
-		tmp := make([]byte, len(*b), 2*cap(*b)+totalLen)
-		copy(tmp, *b)
-		*b = tmp
+	// spew.Dump(cols)
+	// os.Exit(0)
+
+	return cols
+}
+
+func (z *GenomeRow) CoolMySQLColumnsSerialize(buf *[]byte, cols []Column) {
+	totalLen := 1 // first byte for column count
+	for _, c := range cols {
+		totalLen += 1 + 1 + len(c.Name) // scanType + len(name) + name
 	}
-	for i, c := range cols {
-		switch c.Name() {
-		case "upid", "assembly_acc", "assembly_version", "total_length", "created", "1":
-			rb := ptrs[i].(*sql.RawBytes)
-			if *rb == nil {
-				*b = append(*b, 1)
-			} else {
-				*b = append(*b, 0)
-				*b = (*b)[:len(*b)+8]
-				binary.LittleEndian.PutUint64((*b)[len(*b)-8:], uint64(len(*rb)))
-				*b = append(*b, *rb...)
-			}
+
+	// grow our buf cap if it's not big enough
+	// this is the first thing so the buffer *should*
+	// be empty but you know, maybe we want to sync.Pool
+	// it or something
+	if cap(*buf)-len(*buf) < totalLen {
+		tmp := make([]byte, len(*buf), 2*cap(*buf)+totalLen)
+		copy(tmp, *buf)
+		*buf = tmp
+	}
+	*buf = append(*buf, uint8(len(cols)))
+	for _, c := range cols {
+		*buf = append(*buf, c.ScanType)
+		*buf = append(*buf, uint8(len(c.Name)))
+		*buf = append(*buf, []byte(c.Name)...)
+	}
+}
+
+func (z *GenomeRow) CoolMySQLRowSerialize(buf *[]byte, cols []Column, ptrs []interface{}) {
+	totalLen := 0
+	for i := range cols {
+		rb := ptrs[i].(*sql.RawBytes)
+		if *rb == nil {
+			totalLen++
+		} else {
+			totalLen += 1 + 8 + len(*rb)
+		}
+	}
+
+	// grow our buf cap if it's not big enough
+	if cap(*buf)-len(*buf) < totalLen {
+		tmp := make([]byte, len(*buf), 2*cap(*buf)+totalLen)
+		copy(tmp, *buf)
+		*buf = tmp
+	}
+	for i := range cols {
+		rb := ptrs[i].(*sql.RawBytes)
+		if *rb == nil {
+			*buf = append(*buf, 1)
+		} else {
+			*buf = append(*buf, 0)
+			*buf = (*buf)[:len(*buf)+8]
+			binary.LittleEndian.PutUint64((*buf)[len(*buf)-8:], uint64(len(*rb)))
+			*buf = append(*buf, *rb...)
 		}
 	}
 }
 
-func (z *GenomeRow) CoolMySQLRowDeserialize(b *[]byte) (ptrs []interface{}, err error) {
-	ptrs = make([]interface{}, 6) // number for exported fields
+func (z *GenomeRow) CoolMySQLColumnsDeserialize(buf *[]byte) (cols []Column, err error) {
+	if len(*buf) == 0 {
+		return nil, io.EOF
+	}
 
-	if len(*b) == 0 {
+	offset := 0
+
+	cols = make([]Column, (*buf)[offset])
+	offset++
+
+	for i := range cols {
+		scanType := (*buf)[offset]
+		offset++
+
+		nameLen := int((*buf)[offset])
+		offset++
+
+		name := (*buf)[offset : offset+nameLen]
+		offset += nameLen
+
+		cols[i] = Column{
+			Name:     string(name),
+			ScanType: scanType,
+		}
+	}
+
+	(*buf) = (*buf)[offset:]
+
+	return cols, nil
+}
+
+func (z *GenomeRow) CoolMySQLRowDeserialize(buf *[]byte) (ptrs []interface{}, err error) {
+	ptrs = make([]interface{}, z.CoolMySQLExportedColCount())
+
+	if len(*buf) == 0 {
 		return nil, io.EOF
 	}
 	offset := 0
 
 	for i := range ptrs {
 		var src []byte
-		null := (*b)[offset] == 1
+		null := (*buf)[offset] == 1
 		offset++
+
 		if !null {
-			size := int(binary.LittleEndian.Uint64((*b)[offset:]))
+			size := int(binary.LittleEndian.Uint64((*buf)[offset:]))
 			offset += 8
-			src = (*b)[offset : offset+size]
+
+			src = (*buf)[offset : offset+size]
 			offset += size
 		}
 
@@ -80,25 +153,19 @@ func (z *GenomeRow) CoolMySQLRowDeserialize(b *[]byte) (ptrs []interface{}, err 
 		i++
 	}
 
-	(*b) = (*b)[offset:]
+	(*buf) = (*buf)[offset:]
 
 	return ptrs, nil
 }
 
-func (z *GenomeRow) CoolMySQLRowScan(ptrs []interface{}) error {
+func (z *GenomeRow) CoolMySQLRowScan(cols []Column, ptrs []interface{}) error {
 	i := 0
-Cols:
-	for _, c := range cols {
-		switch c.Name() {
-		case "upid", "assembly_acc", "assembly_version", "total_length", "created", "1":
-		default:
-			continue Cols
-		}
 
+	for _, c := range cols {
 		src := []byte(*(ptrs[i].(*sql.RawBytes)))
 		i++
 
-		switch c.Name() {
+		switch c.Name {
 		case "upid":
 			if len(src) == 0 {
 				break
@@ -143,11 +210,18 @@ Cols:
 	return nil
 }
 
-var coolDB, _ = New(user, pass, schema, host, port,
-	user, pass, schema, host, port,
-	nil)
+var coolDB *Database
 
 func init() {
+	var err error
+	coolDB, err = New(user, pass, schema, host, port,
+		user, pass, schema, host, port,
+		nil)
+
+	if err != nil {
+		panic(err)
+	}
+
 	coolDB.EnableRedis("localhost:6379", "", 0)
 }
 
@@ -157,8 +231,8 @@ func Benchmark_Genome_CoolFastDest_Select_Chan_NotCached(b *testing.B) {
 	var genomeCh chan GenomeRow
 	for n := 0; n < b.N; n++ {
 		var i int
-		genomeCh = make(chan GenomeRow)
-		err := coolDB.Select(genomeCh, "select`upid`,`assembly_acc`,`assembly_version`,`total_length`,`created`,1,sleep(1) from`genome`limit 1000", 0)
+		genomeCh = make(chan GenomeRow, 100)
+		err := coolDB.Select(genomeCh, "select`upid`,`assembly_acc`,`assembly_version`,`total_length`,`created`,1 from`genome`limit 1000", 0)
 		if err != nil {
 			panic(err)
 		}
@@ -178,7 +252,7 @@ func Benchmark_Genome_CoolFastDest_Select_Slice_NotCached(b *testing.B) {
 	for n := 0; n < b.N; n++ {
 		var i int
 		genomes = genomes[:0]
-		err := coolDB.Select(&genomes, "select`upid`,`assembly_acc`,`assembly_version`,`total_length`,`created`,1,sleep(1) from`genome`limit 1000", 0)
+		err := coolDB.Select(&genomes, "select`upid`,`assembly_acc`,`assembly_version`,`total_length`,`created`,1 from`genome`limit 1000", 0)
 		if err != nil {
 			panic(err)
 		}

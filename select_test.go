@@ -35,7 +35,9 @@ func Benchmark_Genome_Cool_Select_Chan_NotCached(b *testing.B) {
 	for n := 0; n < b.N; n++ {
 		var i int
 		genomeCh = make(chan genomeRow)
-		err := db.Select(genomeCh, "select`upid`,`assembly_acc`,`assembly_version`,`total_length`,`created`,1 from`genome`limit 1000", 0)
+		err := db.Select(genomeCh, "select`upid`,`assembly_acc`,`assembly_version`,`total_length`,`created`,:One `1` from`genome`limit 1000", 0, map[string]interface{}{
+			"One": 1,
+		})
 		if err != nil {
 			panic(err)
 		}
@@ -171,15 +173,24 @@ func Benchmark_Genome_MySQL_Select_NotCached(b *testing.B) {
 	}
 }
 
-var sqlxDB, _ = sqlx.Connect("mysql", fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=utf8mb4&collation=utf8mb4_unicode_ci&parseTime=true",
-	user,
-	pass,
-	host,
-	port,
-	schema,
-))
+var sqlxDB *sqlx.DB
+
+func init() {
+	var err error
+	sqlxDB, err = sqlx.Connect("mysql", fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=utf8mb4&collation=utf8mb4_unicode_ci&parseTime=true",
+		user,
+		pass,
+		host,
+		port,
+		schema,
+	))
+	if err != nil {
+		panic(err)
+	}
+}
 
 func Benchmark_Genome_SQLx_Select_Slice_NotCached(b *testing.B) {
+	b.ReportAllocs()
 
 	type genomeRow struct {
 		UpID            string          `db:"upid"`
@@ -194,7 +205,7 @@ func Benchmark_Genome_SQLx_Select_Slice_NotCached(b *testing.B) {
 	for n := 0; n < b.N; n++ {
 		var i int
 		genomes = genomes[:0]
-		err := sqlxDB.Select(&genomes, "select`upid`,`assembly_acc`,`assembly_version`,`total_length`,`created`,1,sleep(1) from`genome` limit 1000")
+		err := sqlxDB.Select(&genomes, "select`upid`,`assembly_acc`,`assembly_version`,`total_length`,`created`,1 from`genome` limit 1000")
 		if err != nil {
 			panic(err)
 		}

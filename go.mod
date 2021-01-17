@@ -5,7 +5,6 @@ go 1.15
 require (
 	github.com/Ompluscator/dynamic-struct v1.2.0
 	github.com/davecgh/go-spew v1.1.1
-	github.com/fatih/color v1.10.0
 	github.com/fatih/structs v1.1.0
 	github.com/go-redis/redis/v8 v8.4.4
 	github.com/go-sql-driver/mysql v1.5.0
@@ -13,8 +12,6 @@ require (
 	github.com/jmoiron/sqlx v1.2.1-0.20200615141059-0794cb1f47ee
 	github.com/pkg/errors v0.9.1
 	github.com/shopspring/decimal v1.2.0
-	github.com/tinylib/msgp v1.1.5
-	golang.org/x/mod v0.4.0 // indirect
 	golang.org/x/sync v0.0.0-20201207232520-09787c993a3a
-	golang.org/x/tools v0.0.0-20201229013931-929a8494cf60 // indirect
+	golang.org/x/xerrors v0.0.0-20200804184101-5ec99f83aff1 // indirect
 )
