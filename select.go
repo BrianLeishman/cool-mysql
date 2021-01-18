@@ -5,6 +5,7 @@ import (
 	"crypto/md5"
 	"database/sql"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/gob"
 	"fmt"
 	"io"
@@ -74,12 +75,7 @@ var selectSinglelight = new(singleflight.Group)
 // to tell us exactly how to store raw mysql data into it
 // ideally, these funcs will be generated with `go generate`
 type FastDest interface {
-	CoolMySQLExportedColCount() int
 	CoolMySQLGetColumns(colTypes []*sql.ColumnType) (cols []Column)
-	CoolMySQLColumnsSerialize(buf *[]byte, cols []Column)
-	CoolMySQLRowSerialize(buf *[]byte, cols []Column, ptrs []interface{})
-	CoolMySQLColumnsDeserialize(buf *[]byte) (cols []Column, err error)
-	CoolMySQLRowDeserialize(buf *[]byte) (ptrs []interface{}, err error)
 	CoolMySQLRowScan(cols []Column, ptrs []interface{}) error
 }
 
@@ -124,18 +120,177 @@ type Column struct {
 	ScanType uint8
 }
 
+func getDestCols(rv reflect.Value, colTypes []*sql.ColumnType) (cols []Column) {
+	colTypesMap := make(map[string]int, len(colTypes))
+	for i, ct := range colTypes {
+		colTypesMap[ct.Name()] = i
+	}
+
+	rv = rv.Elem()
+
+	switch rv.Kind() {
+	case reflect.Struct:
+		numField := rv.NumField()
+
+		colsCap := len(colTypes)
+		if numField < colsCap {
+			colsCap = numField
+		}
+
+		cols = make([]Column, 0, len(colTypes))
+
+		rt := rv.Type()
+
+		for i := 0; i < numField; i++ {
+			if !rv.Field(i).CanInterface() {
+				continue
+			}
+
+			f := rt.Field(i)
+			name, ok := f.Tag.Lookup("mysql")
+			if !ok {
+				name = f.Name
+			}
+
+			if colTypeI, ok := colTypesMap[name]; ok {
+				cols = append(cols, Column{
+					Name:     name,
+					ScanType: ScanType(colTypes[colTypeI]),
+				})
+			}
+		}
+	}
+
+	return cols
+}
+
+func serializeDestColumns(buf *[]byte, cols []Column) {
+	totalLen := 1 // first byte for column count
+	for _, c := range cols {
+		totalLen += 1 + 1 + len(c.Name) // scanType + len(name) + name
+	}
+
+	// grow our buf cap if it's not big enough
+	// this is the first thing so the buffer *should*
+	// be empty but you know, maybe we want to sync.Pool
+	// it or something
+	if cap(*buf)-len(*buf) < totalLen {
+		tmp := make([]byte, len(*buf), 2*cap(*buf)+totalLen)
+		copy(tmp, *buf)
+		*buf = tmp
+	}
+	*buf = append(*buf, uint8(len(cols)))
+	for _, c := range cols {
+		*buf = append(*buf, c.ScanType)
+		*buf = append(*buf, uint8(len(c.Name)))
+		*buf = append(*buf, []byte(c.Name)...)
+	}
+}
+
+func serializeDestRow(buf *[]byte, cols []Column, ptrs []interface{}) {
+	totalLen := 0
+	for i := range cols {
+		rb := ptrs[i].(*sql.RawBytes)
+		if *rb == nil {
+			totalLen++
+		} else {
+			totalLen += 1 + 8 + len(*rb)
+		}
+	}
+
+	// grow our buf cap if it's not big enough
+	if cap(*buf)-len(*buf) < totalLen {
+		tmp := make([]byte, len(*buf), 2*cap(*buf)+totalLen)
+		copy(tmp, *buf)
+		*buf = tmp
+	}
+	for i := range cols {
+		rb := ptrs[i].(*sql.RawBytes)
+		if *rb == nil {
+			*buf = append(*buf, 1)
+		} else {
+			*buf = append(*buf, 0)
+			*buf = (*buf)[:len(*buf)+8]
+			binary.LittleEndian.PutUint64((*buf)[len(*buf)-8:], uint64(len(*rb)))
+			*buf = append(*buf, *rb...)
+		}
+	}
+}
+
+func deserializeDestColumns(buf *[]byte) (cols []Column, err error) {
+	if len(*buf) == 0 {
+		return nil, io.EOF
+	}
+
+	offset := 0
+
+	cols = make([]Column, (*buf)[offset])
+	offset++
+
+	for i := range cols {
+		scanType := (*buf)[offset]
+		offset++
+
+		nameLen := int((*buf)[offset])
+		offset++
+
+		name := (*buf)[offset : offset+nameLen]
+		offset += nameLen
+
+		cols[i] = Column{
+			Name:     string(name),
+			ScanType: scanType,
+		}
+	}
+
+	(*buf) = (*buf)[offset:]
+
+	return cols, nil
+}
+
+func deserializeDestRow(colLen int, buf *[]byte) (ptrs []interface{}, err error) {
+	ptrs = make([]interface{}, colLen)
+
+	if len(*buf) == 0 {
+		return nil, io.EOF
+	}
+	offset := 0
+
+	for i := range ptrs {
+		var src []byte
+		null := (*buf)[offset] == 1
+		offset++
+
+		if !null {
+			size := int(binary.LittleEndian.Uint64((*buf)[offset:]))
+			offset += 8
+
+			src = (*buf)[offset : offset+size]
+			offset += size
+		}
+
+		rb := sql.RawBytes(src)
+		ptrs[i] = &rb
+		i++
+	}
+
+	(*buf) = (*buf)[offset:]
+
+	return ptrs, nil
+}
+
 func _select(db *Database, rd reflect.Value, replacedQuery string, cache time.Duration, mergedParams Params) error {
 	rd = reflect.Indirect(rd)
 	rt := getDestType(rd)
 	rv := reflect.New(rt)
 
-	fd := rv.Interface().(FastDest)
+	rvIface := rv.Interface()
+	fd := rvIface.(FastDest)
 
 	var cacheBuf []byte
 
-	// cache = 10 * time.Second
-
-	single := rd.Kind() != reflect.Chan && rd.Kind() != reflect.Slice
+	k := rd.Kind()
+	single := k != reflect.Chan && k != reflect.Slice
 	rowsScanned := 0
 
 	readFromDB := func() error {
@@ -165,14 +320,21 @@ func _select(db *Database, rd reflect.Value, replacedQuery string, cache time.Du
 			rowsScanned++
 
 			if cols == nil {
-				cols = fd.CoolMySQLGetColumns(colTypes)
+				if fd, ok := rvIface.(interface {
+					CoolMySQLGetColumns(colTypes []*sql.ColumnType) (cols []Column)
+				}); ok {
+					cols = fd.CoolMySQLGetColumns(colTypes)
+				} else {
+					cols = getDestCols(rv, colTypes)
+				}
+
 				if cache != 0 {
-					fd.CoolMySQLColumnsSerialize(&cacheBuf, cols)
+					serializeDestColumns(&cacheBuf, cols)
 				}
 			}
 
 			if cache != 0 {
-				fd.CoolMySQLRowSerialize(&cacheBuf, cols, ptrs)
+				serializeDestRow(&cacheBuf, cols, ptrs)
 			}
 
 			err = fd.CoolMySQLRowScan(cols, ptrs)
@@ -235,12 +397,12 @@ func _select(db *Database, rd reflect.Value, replacedQuery string, cache time.Du
 		}
 
 		if b := cachedBytes.([]byte); len(b) != 0 && !scanned {
-			cols, err := fd.CoolMySQLColumnsDeserialize(&b)
+			cols, err := deserializeDestColumns(&b)
 			if err != nil {
 				return err
 			}
 			for {
-				ptrs, err := fd.CoolMySQLRowDeserialize(&b)
+				ptrs, err := deserializeDestRow(len(cols), &b)
 				if err == io.EOF {
 					break
 				} else if err != nil {

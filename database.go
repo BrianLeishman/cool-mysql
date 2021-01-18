@@ -12,8 +12,11 @@ import (
 
 // Database is a cool MySQL connection
 type Database struct {
-	Writes *sql.DB
-	Reads  *sql.DB
+	Writes    *sql.DB
+	writesDSN string
+
+	Reads    *sql.DB
+	readsDSN string
 
 	Log      LogFunc
 	Finished FinishedFunc
@@ -82,36 +85,55 @@ func New(wUser, wPass, wSchema, wHost string, wPort int,
 	return NewFromDSN(writes.FormatDSN(), reads.FormatDSN())
 }
 
+// Connect sets the writes and reads connections for the db
+func (db *Database) Connect() (err error) {
+	db.Writes, err = sql.Open("mysql", db.writesDSN)
+	if err != nil {
+		return err
+	}
+
+	err = db.Writes.Ping()
+	if err != nil {
+		return err
+	}
+
+	writesDSN, _ := mysql.ParseDSN(db.writesDSN)
+	db.maxInsertSize = writesDSN.MaxAllowedPacket
+
+	if db.readsDSN != db.writesDSN {
+		db.Reads, err = sql.Open("mysql", db.readsDSN)
+		if err != nil {
+			return err
+		}
+
+		err = db.Reads.Ping()
+		if err != nil {
+			return err
+		}
+	} else {
+		db.Reads = db.Writes
+	}
+
+	return nil
+}
+
+// Reconnect sets the writes and reads connections for the db
+// alias of Connect
+func (db *Database) Reconnect() (err error) {
+	return db.Connect()
+}
+
 // NewFromDSN creates a new Database from config
 // DSN strings for both connections
 func NewFromDSN(writes, reads string) (db *Database, err error) {
 	db = new(Database)
 
-	db.Writes, err = sql.Open("mysql", writes)
+	db.writesDSN = writes
+	db.readsDSN = reads
+
+	err = db.Connect()
 	if err != nil {
 		return nil, err
-	}
-
-	err = db.Writes.Ping()
-	if err != nil {
-		return nil, err
-	}
-
-	writesDSN, _ := mysql.ParseDSN(writes)
-	db.maxInsertSize = writesDSN.MaxAllowedPacket
-
-	if reads != writes {
-		db.Reads, err = sql.Open("mysql", reads)
-		if err != nil {
-			return nil, err
-		}
-
-		err = db.Reads.Ping()
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		db.Reads = db.Writes
 	}
 
 	return
