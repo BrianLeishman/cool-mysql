@@ -1,4 +1,0 @@
-*.prof
-*.test
-cpuprofile.out
-memprofile.out
