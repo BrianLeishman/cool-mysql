@@ -20,14 +20,6 @@ import (
 
 var selectSingleflight = new(singleflight.Group)
 
-// FastDest is a type that implements all the helper funcs
-// to tell us exactly how to store raw mysql data into it
-// ideally, these funcs will be generated with `go generate`
-type FastDest interface {
-	CoolMySQLGetColumns(colTypes []*sql.ColumnType) (cols []Column)
-	CoolMySQLRowScan(cols []Column, ptrs []interface{}) error
-}
-
 // Select stores the results of the query in the given destination
 func (db *Database) Select(dest interface{}, query string, cache time.Duration, params ...Params) error {
 	return db.SelectContext(context.Background(), dest, query, cache, params...)
@@ -63,18 +55,83 @@ func _select(ctx context.Context, db *Database, rd reflect.Value, replacedQuery 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	rdIface := rd.Interface()
 	rd = reflect.Indirect(rd)
 	rt := getDestType(rd)
 	rv := reflect.New(rt)
 
 	rvIface := rv.Interface()
-	fd := rvIface.(FastDest)
 
 	var cacheBuf []byte
 
-	k := rd.Kind()
-	single := k != reflect.Chan && k != reflect.Slice
+	rdKind := rd.Kind()
+	single := rdKind != reflect.Chan && rdKind != reflect.Slice
 	rowsScanned := 0
+
+	done := ctx.Done()
+
+	cases := []reflect.SelectCase{
+		{
+			Dir:  reflect.SelectRecv,
+			Chan: reflect.ValueOf(done),
+		},
+		{
+			Dir:  reflect.SelectSend,
+			Chan: rd,
+		},
+	}
+
+	getColumner, getColumnerOk := rvIface.(interface {
+		CoolMySQLGetColumns(colTypes []*sql.ColumnType) (cols []Column)
+	})
+	sendChanner, sendChannerOk := rvIface.(interface {
+		CoolMySQLSendChan(done <-chan struct{}, ch interface{}, e interface{}) error
+	})
+	rowScanner, rowScannerOk := rvIface.(interface {
+		CoolMySQLRowScan(cols []Column, ptrs []interface{}) error
+	})
+
+	scanAndSend := func(cols []Column, ptrs []interface{}) error {
+		if rowScannerOk {
+			err := rowScanner.CoolMySQLRowScan(cols, ptrs)
+			if err != nil {
+				return err
+			}
+		} else {
+			err := scanDestRow(rv, cols, ptrs)
+			if err != nil {
+				return err
+			}
+		}
+
+		switch rdKind {
+		case reflect.Chan:
+			if sendChannerOk {
+				err := sendChanner.CoolMySQLSendChan(done, rdIface, rv.Elem().Interface())
+				if err == context.Canceled {
+					cancel()
+					return nil
+				} else if err != nil {
+					return err
+				}
+			} else {
+				cases[1].Send = rv.Elem()
+				switch index, _, _ := reflect.Select(cases); index {
+				case 0:
+					cancel()
+					return nil
+				case 1:
+				}
+			}
+		case reflect.Slice:
+			rd.Set(reflect.Append(rd, rv.Elem()))
+		default:
+			rd.Set(rv.Elem())
+			break
+		}
+
+		return nil
+	}
 
 	readFromDB := func() error {
 		rows, err := db.Reads.QueryContext(ctx, replacedQuery)
@@ -89,7 +146,7 @@ func _select(ctx context.Context, db *Database, rd reflect.Value, replacedQuery 
 		}
 
 		ptrs := make([]interface{}, len(colTypes))
-		for i := 0; i < len(colTypes); i++ {
+		for i := 0; i < len(ptrs); i++ {
 			ptrs[i] = new(sql.RawBytes)
 		}
 
@@ -103,10 +160,8 @@ func _select(ctx context.Context, db *Database, rd reflect.Value, replacedQuery 
 			rowsScanned++
 
 			if cols == nil {
-				if fd, ok := rvIface.(interface {
-					CoolMySQLGetColumns(colTypes []*sql.ColumnType) (cols []Column)
-				}); ok {
-					cols = fd.CoolMySQLGetColumns(colTypes)
+				if getColumnerOk {
+					cols = getColumner.CoolMySQLGetColumns(colTypes)
 				} else {
 					cols = getDestCols(rv, colTypes)
 				}
@@ -120,18 +175,12 @@ func _select(ctx context.Context, db *Database, rd reflect.Value, replacedQuery 
 				serializeDestRow(&cacheBuf, cols, ptrs)
 			}
 
-			err = fd.CoolMySQLRowScan(cols, ptrs)
+			err = scanAndSend(cols, ptrs)
 			if err != nil {
 				return err
 			}
 
-			switch rd.Kind() {
-			case reflect.Chan:
-				rd.Send(rv.Elem())
-			case reflect.Slice:
-				rd.Set(reflect.Append(rd, rv.Elem()))
-			default:
-				rd.Set(rv.Elem())
+			if single {
 				break
 			}
 		}
@@ -192,18 +241,12 @@ func _select(ctx context.Context, db *Database, rd reflect.Value, replacedQuery 
 					return err
 				}
 
-				err = fd.CoolMySQLRowScan(cols, ptrs)
+				err = scanAndSend(cols, ptrs)
 				if err != nil {
-					return err
+					return nil
 				}
 
-				switch rd.Kind() {
-				case reflect.Chan:
-					rd.Send(rv.Elem())
-				case reflect.Slice:
-					rd.Set(reflect.Append(rd, rv.Elem()))
-				default:
-					rd.Set(rv.Elem())
+				if single {
 					break
 				}
 			}
@@ -233,6 +276,15 @@ type Column struct {
 	ScanType uint8
 }
 
+func isGenericStruct(rv reflect.Value) bool {
+	switch rv.Interface().(type) {
+	case sql.Scanner, time.Time:
+		return false
+	}
+
+	return rv.Kind() == reflect.Struct
+}
+
 func getDestCols(rv reflect.Value, colTypes []*sql.ColumnType) (cols []Column) {
 	colTypesMap := make(map[string]int, len(colTypes))
 	for i, ct := range colTypes {
@@ -241,8 +293,7 @@ func getDestCols(rv reflect.Value, colTypes []*sql.ColumnType) (cols []Column) {
 
 	rv = rv.Elem()
 
-	switch rv.Kind() {
-	case reflect.Struct:
+	if isGenericStruct(rv) {
 		numField := rv.NumField()
 
 		colsCap := len(colTypes)
@@ -272,6 +323,11 @@ func getDestCols(rv reflect.Value, colTypes []*sql.ColumnType) (cols []Column) {
 				})
 			}
 		}
+	} else {
+		cols = []Column{{
+			Name:     colTypes[0].Name(),
+			ScanType: ScanType(colTypes[0]),
+		}}
 	}
 
 	return cols
@@ -390,4 +446,44 @@ func deserializeDestRow(colLen int, buf *[]byte) (ptrs []interface{}, err error)
 	(*buf) = (*buf)[offset:]
 
 	return ptrs, nil
+}
+
+func scanDestRow(rv reflect.Value, cols []Column, ptrs []interface{}) error {
+	rv = rv.Elem()
+
+	if isGenericStruct(rv) {
+		// TODO
+	} else {
+		return scanValue(rv, cols[0], []byte(*(ptrs[0].(*sql.RawBytes))))
+	}
+
+	return nil
+}
+
+func scanValue(rv reflect.Value, c Column, src []byte) error {
+	switch x := rv.Interface().(type) {
+	case sql.Scanner:
+		return ScanInto(c, x, src)
+	case time.Time:
+		t, err := time.Parse(time.RFC3339Nano, string(src))
+		if err != nil {
+			return errors.Wrap(err, "failed to scan 'created'")
+		}
+		rv.Set(reflect.ValueOf(t))
+
+		return nil
+	}
+
+	switch k := rv.Kind(); k {
+	// case reflect.Ptr:
+	// 	scanValue(rv.Elem(), c, src)
+	case reflect.String:
+		rv.Set(reflect.ValueOf(string(src)))
+	// case reflect.Array, reflect.Slice, reflect.Map:
+	// 	rv.Set(reflect.ValueOf(string(src)))
+	default:
+		return errors.Errorf("cool-mysql: unhandled scan dest type of %T", rv.Interface())
+	}
+
+	return nil
 }

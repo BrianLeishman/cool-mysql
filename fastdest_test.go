@@ -1,11 +1,13 @@
 package mysql
 
 import (
+	"context"
 	"database/sql"
 	"strconv"
 	"testing"
 	"time"
 
+	"github.com/davecgh/go-spew/spew"
 	"github.com/pkg/errors"
 	"github.com/shopspring/decimal"
 )
@@ -86,6 +88,16 @@ func (z *GenomeRow) CoolMySQLRowScan(cols []Column, ptrs []interface{}) error {
 	return nil
 }
 
+func (z *GenomeRow) CoolMySQLSendChan(done <-chan struct{}, ch interface{}, e interface{}) error {
+	select {
+	case <-done:
+		return context.Canceled
+	case ch.(chan GenomeRow) <- e.(GenomeRow):
+	}
+
+	return nil
+}
+
 var coolDB *Database
 
 func init() {
@@ -138,5 +150,51 @@ func Benchmark_Genome_CoolFastDest_Select_Slice_NotCached(b *testing.B) {
 		if i != 1000 {
 			b.Fatal("didn't get 1k rows!")
 		}
+	}
+}
+
+type genomeUpID string
+
+func (z *genomeUpID) CoolMySQLGetColumns(colTypes []*sql.ColumnType) (cols []Column) {
+	cols = make([]Column, 0, 1)
+	for _, ct := range colTypes {
+		cols = append(cols, Column{
+			Name:     ct.Name(),
+			ScanType: ScanType(ct),
+		})
+		break
+	}
+
+	return cols
+}
+
+func (z *genomeUpID) CoolMySQLRowScan(cols []Column, ptrs []interface{}) error {
+	for i := range cols {
+		src := []byte(*(ptrs[i].(*sql.RawBytes)))
+		if len(src) == 0 {
+			return nil
+		}
+
+		*z = genomeUpID(src)
+
+		break
+	}
+
+	return nil
+}
+
+func Benchmark_Genome_CoolFastDest_Select_String_NotCached(b *testing.B) {
+	b.ReportAllocs()
+
+	var upID time.Time
+	for n := 0; n < b.N; n++ {
+		err := coolDB.Select(&upID, "select`upid`,`assembly_acc`,`assembly_version`,`total_length`,`created`,1 from`genome`limit 1000", 0)
+		if err != nil {
+			panic(err)
+		}
+		if upID.IsZero() {
+			b.Fatal("didn't get an `upid`!")
+		}
+		spew.Dump(upID)
 	}
 }
