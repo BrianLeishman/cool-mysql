@@ -1,7 +1,6 @@
 package mysql
 
 import (
-	"context"
 	"database/sql"
 	"testing"
 	"time"
@@ -85,15 +84,15 @@ type GenomeRow struct {
 // 	return nil
 // }
 
-func (z *GenomeRow) CoolMySQLSendChan(done <-chan struct{}, ch interface{}, e interface{}) error {
-	select {
-	case <-done:
-		return context.Canceled
-	case ch.(chan GenomeRow) <- e.(GenomeRow):
-	}
+// func (z *GenomeRow) CoolMySQLSendChan(done <-chan struct{}, ch interface{}, e interface{}) error {
+// 	select {
+// 	case <-done:
+// 		return context.Canceled
+// 	case ch.(chan GenomeRow) <- e.(GenomeRow):
+// 	}
 
-	return nil
-}
+// 	return nil
+// }
 
 var coolDB *Database
 

@@ -101,17 +101,50 @@ func _select(ctx context.Context, db *Database, rd reflect.Value, replacedQuery 
 		CoolMySQLRowScan(cols []Column, ptrs []interface{}) error
 	})
 
+	var generic bool
+	var fieldCols [][2]int
+	if !rowScannerOk {
+		generic = isGenericStruct(r)
+	}
+
 	scanAndSend := func(cols []Column, ptrs []interface{}) error {
+		var err error
 		if rowScannerOk {
-			err := rowScanner.CoolMySQLRowScan(cols, ptrs)
-			if err != nil {
-				return err
-			}
+			err = rowScanner.CoolMySQLRowScan(cols, ptrs)
 		} else {
-			err := scanDestRow(r, cols, ptrs)
-			if err != nil {
-				return err
+			if generic {
+				if fieldCols == nil {
+					fieldCols = make([][2]int, len(cols))
+
+					colsMap := make(map[string]int, len(cols))
+					for i, c := range cols {
+						colsMap[c.Name] = i
+					}
+
+					for i := 0; i < r.reflectValue.NumField(); i++ {
+						f := r.reflectValue.Field(i)
+						if !f.CanInterface() {
+							continue
+						}
+
+						ft := rt.Field(i)
+						name, ok := ft.Tag.Lookup("mysql")
+						if !ok {
+							name = ft.Name
+						}
+
+						if colI, ok := colsMap[name]; ok {
+							fieldCols = append(fieldCols, [2]int{i, colI})
+						}
+					}
+				}
+				err = scanDestRowGeneric(r, cols, ptrs, fieldCols, rt)
+			} else {
+				err = scanDestColumn(r, cols, ptrs)
 			}
+		}
+		if err != nil {
+			return err
 		}
 
 		switch rdKind {
@@ -456,36 +489,18 @@ func deserializeDestRow(colLen int, buf *[]byte) (ptrs []interface{}, err error)
 	return ptrs, nil
 }
 
-func scanDestRowGeneric(r preflect, cols []Column, ptrs []interface{}) error {
-	colsMap := make(map[string]int, len(cols))
-	for i, c := range cols {
-		colsMap[c.Name] = i
-	}
-
-	rt := r.reflectValue.Type()
-	for i := 0; i < r.reflectValue.NumField(); i++ {
-		f := r.reflectValue.Field(i)
-		if !f.CanInterface() {
-			continue
-		}
-
-		ft := rt.Field(i)
-		name, ok := ft.Tag.Lookup("mysql")
-		if !ok {
-			name = ft.Name
-		}
-
-		if colI, ok := colsMap[name]; ok {
-			addr := f.Addr()
-			err := scanValue(preflect{
-				addrReflectValue: addr,
-				addrIface:        addr.Interface(),
-				reflectValue:     f,
-				iface:            f.Interface(),
-			}, cols[colI], []byte(*(ptrs[colI].(*sql.RawBytes))))
-			if err != nil {
-				return errors.Wrapf(err, "failed to scan into %q", ft.Name)
-			}
+func scanDestRowGeneric(r preflect, cols []Column, ptrs []interface{}, fieldCols [][2]int, rt reflect.Type) error {
+	for _, fc := range fieldCols {
+		f := r.reflectValue.Field(fc[0])
+		addr := f.Addr()
+		err := scanValue(preflect{
+			addrReflectValue: addr,
+			addrIface:        addr.Interface(),
+			reflectValue:     f,
+			iface:            f.Interface(),
+		}, cols[fc[1]], []byte(*(ptrs[fc[1]].(*sql.RawBytes))))
+		if err != nil {
+			return errors.Wrapf(err, "failed to scan into %q", f.Type().Name())
 		}
 	}
 
