@@ -456,44 +456,44 @@ func deserializeDestRow(colLen int, buf *[]byte) (ptrs []interface{}, err error)
 	return ptrs, nil
 }
 
-func scanDestRow(r preflect, cols []Column, ptrs []interface{}) error {
-	if isGenericStruct(r) {
-		colsMap := make(map[string]int, len(cols))
-		for i, c := range cols {
-			colsMap[c.Name] = i
+func scanDestRowGeneric(r preflect, cols []Column, ptrs []interface{}) error {
+	colsMap := make(map[string]int, len(cols))
+	for i, c := range cols {
+		colsMap[c.Name] = i
+	}
+
+	rt := r.reflectValue.Type()
+	for i := 0; i < r.reflectValue.NumField(); i++ {
+		f := r.reflectValue.Field(i)
+		if !f.CanInterface() {
+			continue
 		}
 
-		rt := r.reflectValue.Type()
-		for i := 0; i < r.reflectValue.NumField(); i++ {
-			f := r.reflectValue.Field(i)
-			if !f.CanInterface() {
-				continue
-			}
+		ft := rt.Field(i)
+		name, ok := ft.Tag.Lookup("mysql")
+		if !ok {
+			name = ft.Name
+		}
 
-			ft := rt.Field(i)
-			name, ok := ft.Tag.Lookup("mysql")
-			if !ok {
-				name = ft.Name
-			}
-
-			if colI, ok := colsMap[name]; ok {
-				addr := f.Addr()
-				err := scanValue(preflect{
-					addrReflectValue: addr,
-					addrIface:        addr.Interface(),
-					reflectValue:     f,
-					iface:            f.Interface(),
-				}, cols[colI], []byte(*(ptrs[colI].(*sql.RawBytes))))
-				if err != nil {
-					return errors.Wrapf(err, "failed to scan into %q", ft.Name)
-				}
+		if colI, ok := colsMap[name]; ok {
+			addr := f.Addr()
+			err := scanValue(preflect{
+				addrReflectValue: addr,
+				addrIface:        addr.Interface(),
+				reflectValue:     f,
+				iface:            f.Interface(),
+			}, cols[colI], []byte(*(ptrs[colI].(*sql.RawBytes))))
+			if err != nil {
+				return errors.Wrapf(err, "failed to scan into %q", ft.Name)
 			}
 		}
-	} else {
-		return scanValue(r, cols[0], []byte(*(ptrs[0].(*sql.RawBytes))))
 	}
 
 	return nil
+}
+
+func scanDestColumn(r preflect, cols []Column, ptrs []interface{}) error {
+	return scanValue(r, cols[0], []byte(*(ptrs[0].(*sql.RawBytes))))
 }
 
 type preflect struct {

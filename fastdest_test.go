@@ -6,7 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/davecgh/go-spew/spew"
 	"github.com/shopspring/decimal"
 )
 
@@ -193,6 +192,5 @@ func Benchmark_Genome_CoolFastDest_Select_String_NotCached(b *testing.B) {
 		if upID == 0 {
 			b.Fatal("didn't get an `upid`!")
 		}
-		spew.Dump(upID)
 	}
 }
