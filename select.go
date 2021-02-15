@@ -7,12 +7,10 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/gob"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"reflect"
-	"strconv"
 	"time"
 
 	"github.com/go-redis/redis/v8"
@@ -53,124 +51,161 @@ func (db *Database) SelectContext(ctx context.Context, dest interface{}, query s
 	}
 }
 
-func _select(ctx context.Context, db *Database, rd reflect.Value, replacedQuery string, cache time.Duration, mergedParams Params) error {
+type fieldCol struct {
+	fieldName string
+	colName   string
+	field     reflect.Value
+	col       int
+	scanFunc  func(dst reflect.Value, src []byte) error
+}
+
+// ColumnGetter is a type that implements CoolMySQLGetColumns
+type ColumnGetter interface {
+	CoolMySQLGetColumns(colTypes []*sql.ColumnType) (cols []Column)
+}
+
+// RowScanner is a type that implements CoolMySQLScanRow
+type RowScanner interface {
+	CoolMySQLScanRow(cols []Column, ptrs []interface{}) error
+}
+
+func _select(ctx context.Context, db *Database, destReflectValue reflect.Value, replacedQuery string, cache time.Duration, mergedParams Params) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	rdIface := rd.Interface()
-	rd = reflect.Indirect(rd)
-	rt := getDestType(rd)
-	rv := reflect.New(rt)
+	destReflectValue = reflect.Indirect(destReflectValue)
 
-	rvIface := rv.Interface()
-
-	e := rv.Elem()
-	r := preflect{
-		addrReflectValue: rv,
-		addrIface:        rvIface,
-		reflectValue:     e,
-		iface:            e.Interface(),
-	}
+	reflectType, reflectKind, multipleResults := getDestInfo(destReflectValue)
+	reflectValue := reflect.New(reflectType)
+	reflectValueElem := reflectValue.Elem()
+	iface := reflectValue.Interface()
 
 	var cacheBuf []byte
 
-	rdKind := rd.Kind()
-	single := rdKind != reflect.Chan && rdKind != reflect.Slice
+	destReflectKind := destReflectValue.Kind()
 	rowsScanned := 0
 
 	done := ctx.Done()
 
-	cases := []reflect.SelectCase{
-		{
-			Dir:  reflect.SelectRecv,
-			Chan: reflect.ValueOf(done),
-		},
-		{
-			Dir:  reflect.SelectSend,
-			Chan: rd,
-		},
+	var cases []reflect.SelectCase
+	if destReflectKind == reflect.Chan {
+		cases = []reflect.SelectCase{
+			{
+				Dir:  reflect.SelectRecv,
+				Chan: reflect.ValueOf(done),
+			},
+			{
+				Dir:  reflect.SelectSend,
+				Chan: destReflectValue,
+			},
+		}
 	}
 
-	getColumner, getColumnerOk := rvIface.(interface {
-		CoolMySQLGetColumns(colTypes []*sql.ColumnType) (cols []Column)
-	})
-	sendChanner, sendChannerOk := rvIface.(interface {
-		CoolMySQLSendChan(done <-chan struct{}, ch interface{}, e interface{}) error
-	})
-	rowScanner, rowScannerOk := rvIface.(interface {
-		CoolMySQLRowScan(cols []Column, ptrs []interface{}) error
-	})
+	columnGetter, columnGetterOk := iface.(ColumnGetter)
+	rowScanner, rowScannerOk := iface.(RowScanner)
 
-	var generic bool
-	var fieldCols [][2]int
+	var fieldCols []fieldCol
+	var singleColumn bool
 	if !rowScannerOk {
-		generic = isGenericStruct(r)
+		singleColumn = !isGenericStruct(iface, reflectType, reflectKind)
+	}
+
+	var singleColumnScanFunc func(dst reflect.Value, src []byte) error
+
+	mapKey := "Key"
+	var keyReflectValue reflect.Value
+
+	scan := func(cols []Column, ptrs []interface{}) error {
+		if rowScannerOk {
+			return rowScanner.CoolMySQLScanRow(cols, ptrs)
+		}
+
+		if singleColumn {
+			if singleColumnScanFunc == nil {
+				singleColumnScanFunc = getScanFunc(cols[0], iface, reflectType, reflectKind)
+			}
+
+			src := []byte(*(ptrs[0].(*sql.RawBytes)))
+			err := singleColumnScanFunc(reflectValueElem, src)
+			return errors.Wrapf(err, "failed to scan %q into destination", src)
+		}
+
+		if fieldCols == nil {
+			fieldCols = make([]fieldCol, 0, len(cols))
+
+			colsMap := make(map[string]Column, len(cols))
+			for _, c := range cols {
+				colsMap[c.Name] = c
+			}
+
+			numField := reflectValueElem.NumField()
+			for i := 0; i < numField; i++ {
+				f := reflectValueElem.Field(i)
+				if !f.CanInterface() {
+					continue
+				}
+
+				ft := reflectType.Field(i)
+				name, ok := ft.Tag.Lookup("mysql")
+				if !ok {
+					name = ft.Name
+				}
+
+				if c, ok := colsMap[name]; ok {
+					fieldCols = append(fieldCols, fieldCol{
+						fieldName: ft.Name,
+						colName:   name,
+						field:     f,
+						col:       c.Index,
+						scanFunc:  getScanFunc(c, f.Addr().Interface(), f.Type(), f.Kind()),
+					})
+				}
+			}
+		}
+
+		for _, f := range fieldCols {
+			src := []byte(*(ptrs[f.col].(*sql.RawBytes)))
+			err := f.scanFunc(f.field, src)
+			if err != nil {
+				return errors.Wrapf(err, "failed to scan %q into field %q", src, f.fieldName)
+			}
+
+			if destReflectKind == reflect.Map && f.colName == mapKey {
+				keyReflectValue = f.field
+			}
+		}
+
+		if destReflectKind == reflect.Map {
+			if !keyReflectValue.IsValid() {
+				return errors.Errorf("no column named %q found in results for map key", mapKey)
+			}
+		}
+
+		return nil
 	}
 
 	scanAndSend := func(cols []Column, ptrs []interface{}) error {
-		var err error
-		if rowScannerOk {
-			err = rowScanner.CoolMySQLRowScan(cols, ptrs)
-		} else {
-			if generic {
-				if fieldCols == nil {
-					fieldCols = make([][2]int, len(cols))
-
-					colsMap := make(map[string]int, len(cols))
-					for i, c := range cols {
-						colsMap[c.Name] = i
-					}
-
-					for i := 0; i < r.reflectValue.NumField(); i++ {
-						f := r.reflectValue.Field(i)
-						if !f.CanInterface() {
-							continue
-						}
-
-						ft := rt.Field(i)
-						name, ok := ft.Tag.Lookup("mysql")
-						if !ok {
-							name = ft.Name
-						}
-
-						if colI, ok := colsMap[name]; ok {
-							fieldCols = append(fieldCols, [2]int{i, colI})
-						}
-					}
-				}
-				err = scanDestRowGeneric(r, cols, ptrs, fieldCols, rt)
-			} else {
-				err = scanDestColumn(r, cols, ptrs)
-			}
-		}
+		err := scan(cols, ptrs)
 		if err != nil {
 			return err
 		}
 
-		switch rdKind {
-		case reflect.Chan:
-			if sendChannerOk {
-				err := sendChanner.CoolMySQLSendChan(done, rdIface, rv.Elem().Interface())
-				if err == context.Canceled {
-					cancel()
-					return nil
-				} else if err != nil {
-					return err
-				}
-			} else {
-				cases[1].Send = rv.Elem()
+		if !multipleResults {
+			destReflectValue.Set(reflectValueElem)
+		} else {
+			switch destReflectKind {
+			case reflect.Chan:
+				cases[1].Send = reflectValueElem
 				switch index, _, _ := reflect.Select(cases); index {
 				case 0:
 					cancel()
 					return nil
-				case 1:
 				}
+			case reflect.Slice:
+				destReflectValue.Set(reflect.Append(destReflectValue, reflectValueElem))
+			case reflect.Map:
+				destReflectValue.SetMapIndex(keyReflectValue, reflectValueElem)
 			}
-		case reflect.Slice:
-			rd.Set(reflect.Append(rd, rv.Elem()))
-		default:
-			rd.Set(rv.Elem())
-			break
 		}
 
 		return nil
@@ -203,10 +238,10 @@ func _select(ctx context.Context, db *Database, rd reflect.Value, replacedQuery 
 			rowsScanned++
 
 			if cols == nil {
-				if getColumnerOk {
-					cols = getColumner.CoolMySQLGetColumns(colTypes)
+				if columnGetterOk {
+					cols = columnGetter.CoolMySQLGetColumns(colTypes)
 				} else {
-					cols = getDestCols(r, colTypes)
+					cols = getDestCols(iface, reflectValueElem, reflectType, reflectKind, colTypes)
 				}
 
 				if cache != 0 {
@@ -223,7 +258,7 @@ func _select(ctx context.Context, db *Database, rd reflect.Value, replacedQuery 
 				return err
 			}
 
-			if single {
+			if !multipleResults {
 				break
 			}
 		}
@@ -241,7 +276,7 @@ func _select(ctx context.Context, db *Database, rd reflect.Value, replacedQuery 
 		}
 
 		hasher := md5.New()
-		gob.NewEncoder(hasher).EncodeValue(rv)
+		gob.NewEncoder(hasher).EncodeValue(reflectValueElem)
 		hasher.Write([]byte(replacedQuery))
 		h := base64.RawStdEncoding.EncodeToString(hasher.Sum(nil))
 
@@ -289,86 +324,105 @@ func _select(ctx context.Context, db *Database, rd reflect.Value, replacedQuery 
 					return nil
 				}
 
-				if single {
+				rowsScanned++
+
+				if !multipleResults {
 					break
 				}
 			}
 		}
 	}
 
-	if single && rowsScanned == 0 {
+	if !multipleResults && rowsScanned == 0 {
 		return sql.ErrNoRows
 	}
 
 	return nil
 }
 
-func getDestType(rd reflect.Value) reflect.Type {
-	switch rd.Kind() {
-	case reflect.Chan, reflect.Slice:
-		return rd.Type().Elem()
-	default:
-		return rd.Type()
+func getDestInfo(destReflectValue reflect.Value) (reflectType reflect.Type, reflectKind reflect.Kind, multipleResults bool) {
+	reflectType = destReflectValue.Type()
+	reflectKind = reflectType.Kind()
+
+	if reflectType != reflectTypeBytes && (reflectKind == reflect.Chan || reflectKind == reflect.Slice || reflectKind == reflect.Map) {
+		multipleResults = true
+		reflectType = reflectType.Elem()
+		reflectKind = reflectType.Kind()
 	}
+
+	return
+}
+
+func isGenericStruct(iface interface{}, reflectType reflect.Type, reflectKind reflect.Kind) bool {
+	if reflectKind != reflect.Struct {
+		return false
+	}
+
+	if reflectType == reflectTypeTime {
+		return false
+	}
+
+	if _, ok := iface.(sql.Scanner); ok {
+		return false
+	}
+
+	return true
 }
 
 // Column is the name and scan type of a query column
 // used in (de)serialization
 type Column struct {
 	Name     string
+	Index    int
 	ScanType uint8
 }
 
-func isGenericStruct(r preflect) bool {
-	switch r.iface.(type) {
-	case sql.Scanner, time.Time:
-		return false
-	}
-
-	return r.reflectValue.Kind() == reflect.Struct
-}
-
-func getDestCols(r preflect, colTypes []*sql.ColumnType) (cols []Column) {
-	colTypesMap := make(map[string]int, len(colTypes))
-	for i, ct := range colTypes {
-		colTypesMap[ct.Name()] = i
-	}
-
-	if isGenericStruct(r) {
-		numField := r.reflectValue.NumField()
-
-		colsCap := len(colTypes)
-		if numField < colsCap {
-			colsCap = numField
-		}
-
-		cols = make([]Column, 0, len(colTypes))
-
-		rt := r.reflectValue.Type()
-
-		for i := 0; i < numField; i++ {
-			if !r.reflectValue.Field(i).CanInterface() {
-				continue
-			}
-
-			f := rt.Field(i)
-			name, ok := f.Tag.Lookup("mysql")
-			if !ok {
-				name = f.Name
-			}
-
-			if colTypeI, ok := colTypesMap[name]; ok {
-				cols = append(cols, Column{
-					Name:     name,
-					ScanType: ScanType(colTypes[colTypeI]),
-				})
-			}
-		}
-	} else {
-		cols = []Column{{
+func getDestCols(iface interface{}, reflectValue reflect.Value, reflectType reflect.Type, reflectKind reflect.Kind, colTypes []*sql.ColumnType) (cols []Column) {
+	if !isGenericStruct(iface, reflectType, reflectKind) {
+		// not a "generic" (custom/created by user) struct, so we only have
+		// one column to deal with
+		return []Column{{
 			Name:     colTypes[0].Name(),
 			ScanType: ScanType(colTypes[0]),
 		}}
+	}
+
+	// a custom struct created by the caller, so we need to figure
+	// out how to map that struct's fields to the columns from the query
+
+	numField := reflectType.NumField()
+
+	colsCap := len(colTypes)
+	if numField < colsCap {
+		colsCap = numField
+	}
+
+	cols = make([]Column, 0, colsCap)
+
+	fieldsMap := make(map[string]int, numField)
+	for i := 0; i < numField; i++ {
+		if !reflectValue.Field(i).CanInterface() {
+			continue
+		}
+
+		f := reflectType.Field(i)
+		name, ok := f.Tag.Lookup("mysql")
+		if !ok {
+			name = f.Name
+		}
+
+		fieldsMap[name] = i
+	}
+
+	for i, c := range colTypes {
+		name := c.Name()
+		if _, ok := fieldsMap[name]; ok {
+			cols = append(cols, Column{
+				Name:     name,
+				Index:    i,
+				ScanType: ScanType(c),
+			})
+		}
 	}
 
 	return cols
@@ -399,8 +453,8 @@ func serializeDestColumns(buf *[]byte, cols []Column) {
 
 func serializeDestRow(buf *[]byte, cols []Column, ptrs []interface{}) {
 	totalLen := 0
-	for i := range cols {
-		rb := ptrs[i].(*sql.RawBytes)
+	for _, c := range cols {
+		rb := ptrs[c.Index].(*sql.RawBytes)
 		if *rb == nil {
 			totalLen++
 		} else {
@@ -414,8 +468,8 @@ func serializeDestRow(buf *[]byte, cols []Column, ptrs []interface{}) {
 		copy(tmp, *buf)
 		*buf = tmp
 	}
-	for i := range cols {
-		rb := ptrs[i].(*sql.RawBytes)
+	for _, c := range cols {
+		rb := ptrs[c.Index].(*sql.RawBytes)
 		if *rb == nil {
 			*buf = append(*buf, 1)
 		} else {
@@ -449,6 +503,7 @@ func deserializeDestColumns(buf *[]byte) (cols []Column, err error) {
 
 		cols[i] = Column{
 			Name:     string(name),
+			Index:    i,
 			ScanType: scanType,
 		}
 	}
@@ -487,141 +542,4 @@ func deserializeDestRow(colLen int, buf *[]byte) (ptrs []interface{}, err error)
 	(*buf) = (*buf)[offset:]
 
 	return ptrs, nil
-}
-
-func scanDestRowGeneric(r preflect, cols []Column, ptrs []interface{}, fieldCols [][2]int, rt reflect.Type) error {
-	for _, fc := range fieldCols {
-		f := r.reflectValue.Field(fc[0])
-		addr := f.Addr()
-		err := scanValue(preflect{
-			addrReflectValue: addr,
-			addrIface:        addr.Interface(),
-			reflectValue:     f,
-			iface:            f.Interface(),
-		}, cols[fc[1]], []byte(*(ptrs[fc[1]].(*sql.RawBytes))))
-		if err != nil {
-			return errors.Wrapf(err, "failed to scan into %q", f.Type().Name())
-		}
-	}
-
-	return nil
-}
-
-func scanDestColumn(r preflect, cols []Column, ptrs []interface{}) error {
-	return scanValue(r, cols[0], []byte(*(ptrs[0].(*sql.RawBytes))))
-}
-
-type preflect struct {
-	addrReflectValue reflect.Value
-	addrIface        interface{}
-
-	reflectValue reflect.Value
-	iface        interface{}
-}
-
-func scanValue(r preflect, c Column, src []byte) error {
-	check := func(err error, t string) error {
-		if err != nil {
-			return errors.Wrapf(err, "failed to prase %s from column `%s`", t, c.Name)
-		}
-		return nil
-	}
-
-	switch r.iface.(type) {
-	case time.Time:
-		if len(src) == 0 {
-			return nil
-		}
-		t, err := time.Parse(time.RFC3339Nano, string(src))
-		if err := check(err, "time"); err != nil {
-			return err
-		}
-		r.reflectValue.Set(reflect.ValueOf(t))
-
-		return nil
-	case []byte:
-		var b []byte
-		if src != nil {
-			b = make([]byte, len(src))
-			copy(b, src)
-		}
-		r.reflectValue.SetBytes(b)
-	}
-
-	if scanner, ok := r.reflectValue.Addr().Interface().(sql.Scanner); ok {
-		return ScanInto(c, scanner, src)
-	}
-
-	switch k := r.reflectValue.Kind(); k {
-	case reflect.Ptr:
-		rv := r.reflectValue.Elem()
-		scanValue(preflect{
-			addrReflectValue: r.reflectValue,
-			addrIface:        r.iface,
-			reflectValue:     rv,
-			iface:            rv.Interface(),
-		}, c, src)
-	case reflect.Bool:
-		if len(src) == 0 {
-			return nil
-		}
-		x, err := strconv.ParseBool(string(src))
-		if err := check(err, "bool"); err != nil {
-			return err
-		}
-		r.reflectValue.SetBool(x)
-	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		if len(src) == 0 {
-			return nil
-		}
-		x, err := strconv.ParseUint(string(src), 10, r.reflectValue.Type().Bits())
-		if err := check(err, "uint"); err != nil {
-			return err
-		}
-		r.reflectValue.SetUint(x)
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		if len(src) == 0 {
-			return nil
-		}
-		x, err := strconv.ParseInt(string(src), 10, r.reflectValue.Type().Bits())
-		if err := check(err, "int"); err != nil {
-			return err
-		}
-		r.reflectValue.SetInt(x)
-	case reflect.Float32, reflect.Float64:
-		if len(src) == 0 {
-			return nil
-		}
-		x, err := strconv.ParseFloat(string(src), r.reflectValue.Type().Bits())
-		if err := check(err, "float"); err != nil {
-			return err
-		}
-		r.reflectValue.SetFloat(x)
-	case reflect.Complex64, reflect.Complex128:
-		if len(src) == 0 {
-			return nil
-		}
-		x, err := strconv.ParseComplex(string(src), r.reflectValue.Type().Bits())
-		if err := check(err, "complex"); err != nil {
-			return err
-		}
-		r.reflectValue.SetComplex(x)
-	case reflect.String:
-		if len(src) == 0 {
-			return nil
-		}
-		r.reflectValue.SetString(string(src))
-	case reflect.Array, reflect.Slice, reflect.Map, reflect.Struct:
-		if len(src) == 0 {
-			return nil
-		}
-		err := json.Unmarshal(src, r.reflectValue.Addr().Interface())
-		if err := check(err, "json"); err != nil {
-			return err
-		}
-	default:
-		return errors.Errorf("cool-mysql: unhandled scan dest type of %T", r.reflectValue.Interface())
-	}
-
-	return nil
 }

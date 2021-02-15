@@ -1,219 +1,365 @@
-package mysql
+package mysql_test
 
 import (
 	"database/sql"
-	"fmt"
-	"io/ioutil"
-	"log"
-	"os"
 	"testing"
 	"time"
 
-	"github.com/davecgh/go-spew/spew"
-	"github.com/jmoiron/sqlx"
-	"github.com/shopspring/decimal"
+	mysql "github.com/StirlingMarketingGroup/cool-mysql"
+	. "github.com/stretchr/testify/assert"
 )
 
-func Benchmark_Genome_Cool_Select_Chan_NotCached(b *testing.B) {
-	db, err := New(user, pass, schema, host, port,
-		user, pass, schema, host, port,
-		nil)
-	if err != nil {
-		panic(err)
-	}
-
-	type genomeRow struct {
-		UpID            string          `mysql:"upid"`
-		AssemblyAcc     sql.NullString  `mysql:"assembly_acc"`
-		AssemblyVersion sql.NullInt32   `mysql:"assembly_version"`
-		TotalLength     decimal.Decimal `mysql:"total_length"`
-		Created         time.Time       `mysql:"created"`
-		One             int             `mysql:"1"`
-	}
-
-	var genomeCh chan genomeRow
-	for n := 0; n < b.N; n++ {
-		var i int
-		genomeCh = make(chan genomeRow)
-		err := db.Select(genomeCh, "select`upid`,`assembly_acc`,`assembly_version`,`total_length`,`created`,:One `1` from`genome`limit 1000", 0, map[string]interface{}{
-			"One": 1,
-		})
-		if err != nil {
-			panic(err)
-		}
-		for r := range genomeCh {
-			i += r.One
-		}
-		if i != 1000 {
-			// b.Fatal("didn't get 1k rows!")
-		}
-	}
+type myString struct {
+	String string
 }
 
-func Benchmark_Genome_Cool_Select_Slice_NotCached(b *testing.B) {
-	db, err := New(user, pass, schema, host, port,
-		user, pass, schema, host, port,
-		nil)
-	if err != nil {
-		panic(err)
-	}
-
-	type genomeRow struct {
-		UpID            string          `mysql:"upid"`
-		AssemblyAcc     sql.NullString  `mysql:"assembly_acc"`
-		AssemblyVersion sql.NullInt32   `mysql:"assembly_version"`
-		TotalLength     decimal.Decimal `mysql:"total_length"`
-		Created         time.Time       `mysql:"created"`
-	}
-
-	var genomes []genomeRow
-	for n := 0; n < b.N; n++ {
-		var i int
-		genomes = genomes[:0]
-		err := db.Select(&genomes, "select`upid`,`assembly_acc`,`assembly_version`,`total_length`,`created`from`genome`where`total_length`>@@TotalLength limit 1000", 0, Params{
-			"TotalLength": 28111,
-		})
-		if err != nil {
-			panic(err)
-		}
-		for _, r := range genomes {
-			if r.AssemblyAcc.Valid || r.AssemblyAcc.String == "" {
-				i++
+func (z *myString) CoolMySQLScanRow(cols []mysql.Column, ptrs []interface{}) error {
+	for i, c := range cols {
+		switch c.Name {
+		case "String":
+			src := []byte(*(ptrs[i].(*sql.RawBytes)))
+			if len(src) == 0 {
+				break
 			}
+
+			z.String = string(src)
 		}
-		if i != 1000 {
-			b.Fatal("didn't get 1k rows!")
+	}
+
+	return nil
+}
+
+func TestRowScanner(t *testing.T) {
+	var v myString
+	err := coolDB.Select(&v, "select 'hello!'`String`", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	Equal(t, "hello!", v.String)
+}
+
+func TestString(t *testing.T) {
+	var v string
+	err := coolDB.Select(&v, "select 'hello!'", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	Equal(t, "hello!", v)
+}
+
+func TestNullString(t *testing.T) {
+	var v string
+	err := coolDB.Select(&v, "select null", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	Equal(t, "", v)
+}
+
+func TestStringPtr(t *testing.T) {
+	var v *string
+	err := coolDB.Select(&v, "select 'hello!'", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	Equal(t, "hello!", *v)
+}
+
+func TestNullStringPtr(t *testing.T) {
+	var v *string
+	err := coolDB.Select(&v, "select null", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	Equal(t, (*string)(nil), v)
+}
+
+func TestInt(t *testing.T) {
+	var v int
+	err := coolDB.Select(&v, "select 7", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	Equal(t, 7, v)
+}
+
+func TestNullInt(t *testing.T) {
+	var v int
+	err := coolDB.Select(&v, "select null", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	Equal(t, 0, v)
+}
+
+func TestIntPtr(t *testing.T) {
+	var v *int
+	err := coolDB.Select(&v, "select 7", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	Equal(t, 7, *v)
+}
+
+func TestNullIntPtr(t *testing.T) {
+	var v *int
+	err := coolDB.Select(&v, "select null", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	Equal(t, (*int)(nil), v)
+}
+
+func TestScan(t *testing.T) {
+	var v sql.NullString
+	err := coolDB.Select(&v, "select 'hello!'", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	Equal(t, "hello!", v.String)
+}
+
+func TestNullScan(t *testing.T) {
+	var v sql.NullString
+	err := coolDB.Select(&v, "select null", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	Equal(t, false, v.Valid)
+}
+
+func TestGenericStruct(t *testing.T) {
+	var v struct {
+		Hello  string
+		Number int
+	}
+	err := coolDB.Select(&v, "select 'hello!'`Hello`,7`Number`", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	Equal(t, struct {
+		Hello  string
+		Number int
+	}{"hello!", 7}, v)
+}
+
+func TestGenericStructDifferentOrder(t *testing.T) {
+	var v struct {
+		Number int
+		World  string
+		Hello  string
+	}
+	err := coolDB.Select(&v, "select 'hello!'`Hello`,7`Number`,'not used!'", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	Equal(t, struct {
+		Number int
+		World  string
+		Hello  string
+	}{7, "", "hello!"}, v)
+}
+
+func TestGenericStructNamedField(t *testing.T) {
+	var v struct {
+		Hello  string `mysql:"bye"`
+		Number int
+	}
+	err := coolDB.Select(&v, "select 'hello!'`Hello`,7`Number`,'bye!'`bye`", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	Equal(t, struct {
+		Hello  string `mysql:"bye"`
+		Number int
+	}{"bye!", 7}, v)
+}
+
+func TestGenericStructJSON(t *testing.T) {
+	var v struct {
+		Object map[string]string
+		Ints   []int
+	}
+	err := coolDB.Select(&v, "select '{\"hello\": \"world\"}'`Object`,'[1, 2, 3]'`Ints`", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	Equal(t, struct {
+		Object map[string]string
+		Ints   []int
+	}{map[string]string{"hello": "world"}, []int{1, 2, 3}}, v)
+}
+
+func TestIntSlice(t *testing.T) {
+	var v []int
+	err := coolDB.Select(&v, "select 7 union select 2", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	Equal(t, []int{7, 2}, v)
+}
+
+func TestIntChan(t *testing.T) {
+	v := make(chan int)
+	err := coolDB.Select(v, "select 7 union select 2", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	Equal(t, 7, <-v)
+	Equal(t, 2, <-v)
+}
+
+// sadly it's not possible to detect the difference between uint8 and byte *at all*
+// func TestUint8Slice(t *testing.T) {
+// 	var v []uint8
+// 	err := coolDB.Select(&v, "select 7 union select 2", 0)
+// 	if err != nil {
+// 		t.Fatal(err)
+// 	}
+
+// 	Equal(t, []uint8{7, 2}, v)
+// }
+
+func TestByteSlice(t *testing.T) {
+	var v []byte
+	err := coolDB.Select(&v, "select 0x001234", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	Equal(t, []byte{0x0, 0x12, 0x34}, v)
+}
+
+func TestByteSliceSlice(t *testing.T) {
+	var v [][]byte
+	err := coolDB.Select(&v, "select 0x001234 union select 0x005678", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	Equal(t, [][]byte{{0x0, 0x12, 0x34}, {0x0, 0x56, 0x78}}, v)
+}
+
+func TestTime(t *testing.T) {
+	var v time.Time
+	err := coolDB.Select(&v, "select curdate()", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	Equal(t, time.Now().Truncate(24*time.Hour).UTC().Format(time.RFC3339Nano), v.UTC().Format(time.RFC3339Nano))
+}
+
+func TestTimeSlice(t *testing.T) {
+	var v []time.Time
+	err := coolDB.Select(&v, "select curdate() union select curdate()+interval 1 day", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i, vv := range v {
+		switch i {
+		case 0:
+			Equal(t, time.Now().Truncate(24*time.Hour).UTC().Format(time.RFC3339Nano), vv.UTC().Format(time.RFC3339Nano))
+		case 1:
+			Equal(t, time.Now().Truncate(24*time.Hour).Add(24*time.Hour).UTC().Format(time.RFC3339Nano), vv.UTC().Format(time.RFC3339Nano))
 		}
 	}
 }
 
-func Benchmark_Genome_Cool_Select_Struct_NotCached(b *testing.B) {
-	db, err := New(user, pass, schema, host, port,
-		user, pass, schema, host, port,
-		nil)
+func TestStringCached(t *testing.T) {
+	var v string
+	err := coolDB.Select(&v, "select uuid()", time.Second)
 	if err != nil {
-		panic(err)
+		t.Fatal(err)
 	}
 
-	type genomeRow struct {
-		UpID            string          `mysql:"upid"`
-		AssemblyAcc     sql.NullString  `mysql:"assembly_acc"`
-		AssemblyVersion sql.NullInt32   `mysql:"assembly_version"`
-		TotalLength     decimal.Decimal `mysql:"total_length"`
-		Created         time.Time       `mysql:"created"`
-	}
-
-	var genome genomeRow
-	for n := 0; n < b.N; n++ {
-		err := db.Select(&genome, "select`upid`,`assembly_acc`,`assembly_version`,`total_length`,`created`from`genome`where`total_length`>@@TotalLength limit 1", 0, Params{
-			"TotalLength": 28111,
-		})
-		if err != nil {
-			panic(err)
-		}
-	}
-
-	f, err := ioutil.TempFile("", "prefix")
+	var v2 string
+	err = coolDB.Select(&v2, "select uuid()", time.Second)
 	if err != nil {
-		log.Fatal(err)
+		t.Fatal(err)
 	}
-	defer os.Remove(f.Name())
-	spew.Fdump(f, len(genome.UpID))
+
+	Equal(t, v, v2)
+
+	time.Sleep(2 * time.Second)
+
+	err = coolDB.Select(&v2, "select uuid()", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	NotEqual(t, v, v2)
 }
 
-func Benchmark_Genome_MySQL_Select_NotCached(b *testing.B) {
-	db, err := sql.Open("mysql", fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=utf8mb4&collation=utf8mb4_unicode_ci&parseTime=true",
-		user,
-		pass,
-		host,
-		port,
-		schema,
-	))
+func TestGenericStructDifferentOrderCached(t *testing.T) {
+	var v struct {
+		Number int
+		World  string
+		Hello  string
+	}
+	err := coolDB.Select(&v, "select 'hello!'`Hello`,7`Number`,'not used!'", time.Second)
 	if err != nil {
-		panic(err)
+		t.Fatal(err)
 	}
 
-	err = db.Ping()
+	Equal(t, struct {
+		Number int
+		World  string
+		Hello  string
+	}{7, "", "hello!"}, v)
+
+	err = coolDB.Select(&v, "select 'hello!'`Hello`,7`Number`,'not used!'", time.Second)
 	if err != nil {
-		panic(err)
+		t.Fatal(err)
 	}
 
-	type genomeRow struct {
-		UpID            string
-		AssemblyAcc     sql.NullString
-		AssemblyVersion sql.NullInt32
-		TotalLength     decimal.Decimal
-		Created         time.Time
-	}
-
-	for n := 0; n < b.N; n++ {
-		var i int
-		rows, err := db.Query("select`upid`,`assembly_acc`,`assembly_version`,`total_length`,`created`from`genome`where`total_length`>? limit 1000", 28111)
-		if err != nil {
-			panic(err)
-		}
-		defer rows.Close()
-
-		for rows.Next() {
-			var genome genomeRow
-			err = rows.Scan(
-				&genome.UpID,
-				&genome.AssemblyAcc,
-				&genome.AssemblyVersion,
-				&genome.TotalLength,
-				&genome.Created,
-			)
-			if genome.AssemblyAcc.Valid || genome.AssemblyAcc.String == "" {
-				i++
-			}
-		}
-		if i != 1000 {
-			b.Fatal("didn't get 1k rows!")
-		}
-	}
+	Equal(t, struct {
+		Number int
+		World  string
+		Hello  string
+	}{7, "", "hello!"}, v)
 }
 
-var sqlxDB *sqlx.DB
-
-func init() {
-	var err error
-	sqlxDB, err = sqlx.Connect("mysql", fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=utf8mb4&collation=utf8mb4_unicode_ci&parseTime=true",
-		user,
-		pass,
-		host,
-		port,
-		schema,
-	))
+func TestGenericStructNamedFieldCached(t *testing.T) {
+	var v struct {
+		Hello  string `mysql:"bye"`
+		Number int
+	}
+	err := coolDB.Select(&v, "select 'hello!'`Hello`,7`Number`,'bye!'`bye`", time.Second)
 	if err != nil {
-		panic(err)
-	}
-}
-
-func Benchmark_Genome_SQLx_Select_Slice_NotCached(b *testing.B) {
-	b.ReportAllocs()
-
-	type genomeRow struct {
-		UpID            string          `db:"upid"`
-		AssemblyAcc     sql.NullString  `db:"assembly_acc"`
-		AssemblyVersion sql.NullInt32   `db:"assembly_version"`
-		TotalLength     decimal.Decimal `db:"total_length"`
-		Created         time.Time       `db:"created"`
-		One             int             `db:"1"`
+		t.Fatal(err)
 	}
 
-	var genomes []genomeRow
-	for n := 0; n < b.N; n++ {
-		var i int
-		genomes = genomes[:0]
-		err := sqlxDB.Select(&genomes, "select`upid`,`assembly_acc`,`assembly_version`,`total_length`,`created`,1 from`genome` limit 1000")
-		if err != nil {
-			panic(err)
-		}
-		for _, r := range genomes {
-			i += r.One
-		}
-		if i != 1000 {
-			b.Fatal("didn't get 1k rows!")
-		}
+	Equal(t, struct {
+		Hello  string `mysql:"bye"`
+		Number int
+	}{"bye!", 7}, v)
+
+	err = coolDB.Select(&v, "select 'hello!'`Hello`,7`Number`,'bye!'`bye`", time.Second)
+	if err != nil {
+		t.Fatal(err)
 	}
+
+	Equal(t, struct {
+		Hello  string `mysql:"bye"`
+		Number int
+	}{"bye!", 7}, v)
 }

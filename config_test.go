@@ -1,9 +1,10 @@
-package mysql
+package mysql_test
 
 import (
 	"database/sql"
 	"time"
 
+	mysql "github.com/StirlingMarketingGroup/cool-mysql"
 	"github.com/shopspring/decimal"
 )
 
@@ -21,4 +22,19 @@ type genomeRow struct {
 	AssemblyVersion sql.NullInt32
 	TotalLength     decimal.Decimal
 	Created         time.Time
+}
+
+var coolDB *mysql.Database
+
+func init() {
+	var err error
+	coolDB, err = mysql.New(user, pass, schema, host, port,
+		user, pass, schema, host, port,
+		nil)
+
+	if err != nil {
+		panic(err)
+	}
+
+	coolDB.EnableRedis("localhost:6379", "", 0)
 }
