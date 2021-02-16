@@ -20,35 +20,45 @@ import (
 
 var selectSingleflight = new(singleflight.Group)
 
+// SelectOpts is the options for the select
+type SelectOpts struct {
+	Context context.Context
+	cancel  context.CancelFunc
+
+	Database    *Database
+	Destination interface{}
+	Query       string
+	Cache       time.Duration
+	Params      []Params
+
+	replacedQuery string
+	mergedParams  Params
+
+	destReflect reflect.Value
+}
+
 // Select stores the results of the query in the given destination
 func (db *Database) Select(dest interface{}, query string, cache time.Duration, params ...Params) error {
-	return db.SelectContext(context.Background(), dest, query, cache, params...)
+	return SelectOptions(SelectOpts{
+		Database:    db,
+		Destination: dest,
+		Query:       query,
+		Cache:       cache,
+		Params:      params,
+	})
 }
 
 // SelectContext stores the results of the query in the given destination
+// can be canceled using the context param
 func (db *Database) SelectContext(ctx context.Context, dest interface{}, query string, cache time.Duration, params ...Params) error {
-	replacedQuery, mergedParams := ReplaceParams(query, params...)
-	if db.die {
-		fmt.Println(replacedQuery)
-		os.Exit(0)
-	}
-
-	rd := reflect.ValueOf(dest)
-	switch rd.Kind() {
-	case reflect.Chan:
-		go func() {
-			err := _select(ctx, db, rd, replacedQuery, cache, mergedParams)
-			if err != nil {
-				panic(err)
-			}
-			rd.Close()
-		}()
-		return nil
-	case reflect.Ptr:
-		return _select(ctx, db, rd, replacedQuery, cache, mergedParams)
-	default:
-		return errors.New("cool-mysql: select destination must be a channel or a pointer to something")
-	}
+	return SelectOptions(SelectOpts{
+		Context:     ctx,
+		Database:    db,
+		Destination: dest,
+		Query:       query,
+		Cache:       cache,
+		Params:      params,
+	})
 }
 
 type fieldCol struct {
@@ -67,6 +77,24 @@ type ColumnGetter interface {
 // RowScanner is a type that implements CoolMySQLScanRow
 type RowScanner interface {
 	CoolMySQLScanRow(cols []Column, ptrs []interface{}) error
+}
+
+// SelectOptions stores the results of the query in the given destination
+func SelectOptions(opts SelectOpts) error {
+	opts.replacedQuery, opts.mergedParams = ReplaceParams(opts.Query, opts.Params...)
+	if opts.Database.die {
+		fmt.Println(opts.replacedQuery)
+		os.Exit(0)
+	}
+
+	opts.destReflect = reflect.Indirect(reflect.ValueOf(opts.Destination))
+
+	if opts.Context != nil {
+		opts.Context, opts.cancel = context.WithCancel(opts.Context)
+		defer opts.cancel()
+	}
+
+	return nil
 }
 
 func _select(ctx context.Context, db *Database, destReflectValue reflect.Value, replacedQuery string, cache time.Duration, mergedParams Params) error {
