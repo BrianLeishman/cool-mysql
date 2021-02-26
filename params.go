@@ -1,4 +1,4 @@
-package mysql
+package cool
 
 import (
 	"encoding/hex"
@@ -140,9 +140,9 @@ func ReplaceParams(query string, params ...Params) (replacedQuery string, merged
 	return s.String(), params[0]
 }
 
-// Encodable is a type with it's own cool mysql
+// Encoder is a type with it's own cool mysql
 // encode method for safe replacing
-type Encodable interface {
+type Encoder interface {
 	CoolMySQLEncode(Builder)
 }
 
@@ -231,7 +231,7 @@ func WriteEncoded(s Builder, x interface{}, possiblyNull bool) {
 	case float64:
 		s.WriteString(strconv.FormatFloat(float64(v), 'E', -1, 64))
 		return
-	case Encodable:
+	case Encoder:
 		v.CoolMySQLEncode(s)
 		return
 	case decimal.Decimal:

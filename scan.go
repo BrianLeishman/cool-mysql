@@ -1,4 +1,4 @@
-package mysql
+package cool
 
 import (
 	"database/sql"

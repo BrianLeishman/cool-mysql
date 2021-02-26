@@ -1,4 +1,4 @@
-package mysql
+package cool
 
 // Literal is a literal MySQL string,
 // not to be encoded or escaped in any way

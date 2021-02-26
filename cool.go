@@ -1,4 +1,4 @@
-package mysql
+package cool
 
 import (
 	"database/sql"
@@ -18,8 +18,7 @@ type Database struct {
 	Reads    *sql.DB
 	readsDSN string
 
-	Log      LogFunc
-	Finished FinishedFunc
+	Complete CompleteFunc
 
 	die bool
 
@@ -28,8 +27,7 @@ type Database struct {
 	redis *redis.Client
 }
 
-// Clone returns a copy of the db with the same connections
-// but with an empty query log
+// Clone returns a copy of the Database with the same connections
 func (db *Database) Clone() *Database {
 	clone := *db
 	return &clone
@@ -45,18 +43,8 @@ func (db *Database) EnableRedis(address string, password string, redisDB int) {
 	})
 }
 
-// LogFunc is called after the query executes
-type LogFunc func(query string, params Params, duration time.Duration)
-
-// FinishedFunc executes after all rows have been processed,
-// including being read from the channel if used
-type FinishedFunc func(cached bool, replacedQuery string, mergedParams Params, execDuration time.Duration, fetchDuration time.Duration)
-
-func (db *Database) callLog(query string, params Params, duration time.Duration) {
-	if db.Log != nil {
-		db.Log(query, params, duration)
-	}
-}
+// CompleteFunc executes right before a Database method call return
+type CompleteFunc func(cached bool, replacedQuery string, mergedParams Params, execDuration time.Duration, fetchDuration time.Duration)
 
 // New creates a new Database
 func New(wUser, wPass, wSchema, wHost string, wPort int,

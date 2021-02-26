@@ -1,4 +1,4 @@
-package mysql_test
+package cool_test
 
 import (
 	"database/sql"
